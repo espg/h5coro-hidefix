@@ -269,3 +269,186 @@ def test_read_with_missing_source_raises(idx, tmp_path):
     loaded = Index.load(p, source=tmp_path / "missing.h5")
     with pytest.raises(Exception):
         loaded.read("/gt1l/heights/h_ph", 0, 1)
+
+
+def _extract_meta(idx, names):
+    """Produce from_chunks() input from a real index via the public getters
+    only -- the same operation the zagg-side extractor performs."""
+    meta = {}
+    for name in names:
+        addrs, sizes, offsets = idx.chunks(name)
+        filt = idx.filters(name)
+        meta[name] = dict(
+            dtype=idx.dtype(name),
+            shape=idx.shape(name),
+            chunk_shape=idx.chunk_shape(name),
+            gzip=filt["gzip"],
+            shuffle=filt["shuffle"],
+            addrs=addrs,
+            sizes=sizes,
+            offsets=offsets,
+        )
+    return meta
+
+
+def test_filters(idx):
+    import sys
+
+    for name in DSETS[:3]:
+        filt = idx.filters(name)
+        assert filt == {"gzip": 6, "shuffle": True, "byte_order": sys.byteorder}
+    filt = idx.filters("/meta/plain")
+    assert filt["gzip"] is None and filt["shuffle"] is False
+    with pytest.raises(KeyError):
+        idx.filters("/nope")
+
+
+def test_from_chunks_roundtrip(idx, ref, h5file):
+    meta = _extract_meta(idx, DSETS)
+    v = Index.from_chunks(h5file, meta)
+    assert v.datasets() == sorted(DSETS)
+    assert str(v.source) == str(h5file)
+    for name in DSETS:
+        assert v.shape(name) == idx.shape(name)
+        assert v.chunk_shape(name) == idx.chunk_shape(name)
+        assert v.dtype(name) == idx.dtype(name)
+        assert v.filters(name) == idx.filters(name)
+        a1, s1, o1 = idx.chunks(name)
+        a2, s2, o2 = v.chunks(name)
+        np.testing.assert_array_equal(a1, a2)
+        np.testing.assert_array_equal(s1, s2)
+        np.testing.assert_array_equal(o1, o2)
+    n = ref["/gt1l/heights/h_ph"].shape[0]
+    for name in DSETS[:3]:
+        for start, end in [(None, None), (0, 1), (CHUNK - 1, CHUNK + 1), (7, 7), (n - 3, n)]:
+            got = v.read(name, start, end)
+            expect = idx.read(name, start, end)
+            assert got.shape == expect.shape
+            assert got.dtype == expect.dtype
+            assert got.tobytes() == expect.tobytes()
+            assert got.tobytes() == ref[name][start:end].tobytes()
+            p1, p2 = v.read_plan(name, start, end), idx.read_plan(name, start, end)
+            for x1, x2 in zip(p1, p2):
+                np.testing.assert_array_equal(x1, x2)
+            buffers = _fetch(h5file, p1[0], p1[1])
+            got = v.read_from_buffers(name, buffers, start, end)
+            assert got.tobytes() == expect.tobytes()
+
+
+def test_from_chunks_no_file_access(idx, tmp_path, h5file):
+    """The sidecar property: construction and buffer-fed reads never touch
+    the granule path, which may not exist locally."""
+    meta = _extract_meta(idx, ["/gt1l/heights/h_ph"])
+    phantom = tmp_path / "not-downloaded" / "granule.h5"
+    v = Index.from_chunks(phantom, meta)  # must not raise
+    name = "/gt1l/heights/h_ph"
+    addrs, sizes, _ = v.read_plan(name, 0, 2 * CHUNK)  # no file access
+    buffers = _fetch(h5file, addrs, sizes)  # "ranged GETs" from the real file
+    got = v.read_from_buffers(name, buffers, 0, 2 * CHUNK)
+    assert got.tobytes() == idx.read(name, 0, 2 * CHUNK).tobytes()
+    with pytest.raises(Exception):  # the local read path does need the file
+        v.read(name, 0, 1)
+
+
+def test_from_chunks_save_load(idx, ref, h5file, tmp_path):
+    v = Index.from_chunks(h5file, _extract_meta(idx, DSETS))
+    p = tmp_path / "virtual.idx"
+    v.save(p)
+    loaded = Index.load(p)
+    assert loaded.datasets() == v.datasets()
+    assert str(loaded.source) == str(h5file)  # embedded at from_chunks time
+    for name in DSETS:
+        a1, s1, o1 = v.chunks(name)
+        a2, s2, o2 = loaded.chunks(name)
+        np.testing.assert_array_equal(a1, a2)
+        np.testing.assert_array_equal(s1, s2)
+        np.testing.assert_array_equal(o1, o2)
+        assert loaded.read(name).tobytes() == ref[name].tobytes()
+
+
+def test_from_chunks_unsorted_rows(idx, ref, h5file):
+    """Chunk rows may arrive in any order (e.g. parquet row-group order)."""
+    meta = _extract_meta(idx, ["/gt1l/heights/signal_conf_ph"])
+    m = meta["/gt1l/heights/signal_conf_ph"]
+    m["addrs"] = m["addrs"][::-1].copy()
+    m["sizes"] = m["sizes"][::-1].copy()
+    m["offsets"] = m["offsets"][::-1].copy()
+    v = Index.from_chunks(h5file, meta)
+    got = v.read("/gt1l/heights/signal_conf_ph")
+    assert got.tobytes() == ref["/gt1l/heights/signal_conf_ph"].tobytes()
+
+
+def test_from_chunks_plain_python_inputs(idx, ref, h5file):
+    """Lists instead of numpy arrays, dtype as '<f8' style, zero filter_mask."""
+    meta = _extract_meta(idx, ["/gt1l/heights/h_ph"])
+    m = meta["/gt1l/heights/h_ph"]
+    k = len(m["addrs"])
+    m2 = dict(
+        dtype="<f8",
+        shape=list(m["shape"]),
+        chunk_shape=list(m["chunk_shape"]),
+        gzip=m["gzip"],
+        shuffle=m["shuffle"],
+        addrs=[int(a) for a in m["addrs"]],
+        sizes=[int(s) for s in m["sizes"]],
+        offsets=[[int(x) for x in row] for row in m["offsets"]],
+        filter_mask=[0] * k,
+    )
+    v = Index.from_chunks(str(h5file), {"/gt1l/heights/h_ph": m2})
+    assert v.read("/gt1l/heights/h_ph").tobytes() == ref["/gt1l/heights/h_ph"].tobytes()
+
+
+def test_from_chunks_errors(idx, h5file):
+    name = "/gt1l/heights/h_ph"
+    base = _extract_meta(idx, [name])[name]
+
+    def variant(**kw):
+        m = dict(base)
+        m.update(kw)
+        return {name: m}
+
+    def drop(key):
+        m = dict(base)
+        del m[key]
+        return {name: m}
+
+    for key in ("dtype", "shape", "chunk_shape", "gzip", "shuffle", "addrs", "sizes", "offsets"):
+        with pytest.raises(ValueError, match=key):
+            Index.from_chunks(h5file, drop(key))
+    with pytest.raises(ValueError, match="unsupported dtype"):
+        Index.from_chunks(h5file, variant(dtype="c16"))
+    with pytest.raises(ValueError, match="rank"):
+        Index.from_chunks(h5file, variant(shape=()))
+    with pytest.raises(ValueError, match="rank"):
+        Index.from_chunks(h5file, variant(chunk_shape=(CHUNK, 5)))
+    with pytest.raises(ValueError, match="length mismatch"):
+        Index.from_chunks(h5file, variant(sizes=base["sizes"][:-1]))
+    with pytest.raises(ValueError, match="requires"):  # wrong chunk count
+        Index.from_chunks(
+            h5file,
+            variant(
+                addrs=base["addrs"][:-1],
+                sizes=base["sizes"][:-1],
+                offsets=base["offsets"][:-1],
+            ),
+        )
+    bad_offsets = base["offsets"].copy()
+    bad_offsets[1, 0] += 1  # not chunk-aligned
+    with pytest.raises(ValueError, match="chunk-aligned"):
+        Index.from_chunks(h5file, variant(offsets=bad_offsets))
+    dup_offsets = base["offsets"].copy()
+    dup_offsets[1] = dup_offsets[0]
+    with pytest.raises(ValueError, match="duplicate"):
+        Index.from_chunks(h5file, variant(offsets=dup_offsets))
+    with pytest.raises(ValueError, match="bool"):
+        Index.from_chunks(h5file, variant(gzip=True))
+    with pytest.raises(ValueError, match="filter_mask"):
+        Index.from_chunks(h5file, variant(filter_mask=[0] * (len(base["addrs"]) - 1)))
+    mask = [0] * len(base["addrs"])
+    mask[3] = 2
+    with pytest.raises(ValueError, match="nonzero filter_mask"):
+        Index.from_chunks(h5file, variant(filter_mask=mask))
+    with pytest.raises(ValueError, match="value must be a dict"):
+        Index.from_chunks(h5file, {name: 42})
+    with pytest.raises(ValueError, match="invalid dataset path"):
+        Index.from_chunks(h5file, {"///": dict(base)})

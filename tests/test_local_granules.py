@@ -109,3 +109,40 @@ def test_read_from_buffers_matches_read(idx, granule):
             assert got.shape == via_read.shape
             assert got.dtype == via_read.dtype
             assert got.tobytes() == via_read.tobytes()
+
+
+def test_from_chunks_roundtrip(idx, granule):
+    """Extractor -> from_chunks round-trip on a real granule: byte-identical
+    direct and buffer-fed reads with no granule access at construction."""
+    names = _present(idx)
+    meta = {}
+    for name in names:
+        addrs, sizes, offsets = idx.chunks(name)
+        filt = idx.filters(name)
+        meta[name] = dict(
+            dtype=idx.dtype(name),
+            shape=idx.shape(name),
+            chunk_shape=idx.chunk_shape(name),
+            gzip=filt["gzip"],
+            shuffle=filt["shuffle"],
+            addrs=addrs,
+            sizes=sizes,
+            offsets=offsets,
+        )
+    v = Index.from_chunks(granule, meta)
+    for name in names:
+        n = idx.shape(name)[0]
+        for start, end in [(0, 1), (n // 2, n // 2 + 250_000), (n - 5, n)]:
+            expect = idx.read(name, start, end)
+            got = v.read(name, start, end)
+            assert got.shape == expect.shape
+            assert got.dtype == expect.dtype
+            assert got.tobytes() == expect.tobytes()
+            addrs, sizes, _ = v.read_plan(name, start, end)
+            with open(granule, "rb") as f:
+                buffers = []
+                for addr, size in zip(addrs, sizes):
+                    f.seek(int(addr))
+                    buffers.append(f.read(int(size)))
+            got = v.read_from_buffers(name, buffers, start, end)
+            assert got.tobytes() == expect.tobytes()

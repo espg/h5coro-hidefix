@@ -28,6 +28,14 @@ This binding fixes all three while keeping the surface minimal:
   exact request shape. **Never squeezes**: a `(1, 5)` request returns
   `(1, 5)`, byte-identical with `h5py_dataset[start:end]`. The GIL is
   released for the duration of the read.
+- `Index.read_plan(dataset, start=None, end=None)` /
+  `Index.read_from_buffers(dataset, buffers, start=None, end=None)` — the
+  object-store read path: the plan lists the chunks a read needs (the same
+  `(addrs, sizes, offsets)` triple as `chunks()`, restricted to the row
+  range, ascending dataspace offset); the caller fetches those byte ranges
+  itself and hands the raw stored bytes back for decode + assembly,
+  byte-identical to `read()`. No file or network access happens inside the
+  binding.
 
 Design discussion: [englacial/zagg#155](https://github.com/englacial/zagg/issues/155).
 
@@ -66,10 +74,40 @@ one = idx.read("/gt1l/heights/signal_conf_ph", 7, 8)        # int8 (1, 5) -- not
 addrs, sizes, offsets = idx.chunks("/gt1l/heights/h_ph")    # uint64 arrays
 ```
 
+## Obstore-fed reads (the Lambda worker flow)
+
+Workers never open the HDF5 file: indices are built once at catalog time,
+and at read time the worker loads the index, asks which byte ranges a
+row-slice needs, fetches those ranges itself (obstore/boto3 ranged GETs),
+and hands the raw bytes back for decode:
+
+```python
+import obstore
+import h5coro_hidefix as hx
+
+idx = hx.Index.load("granule.idx")          # ~1 ms; zero HDF5 metadata I/O
+name = "/gt1l/heights/h_ph"
+
+addrs, sizes, _ = idx.read_plan(name, row0, row1)
+buffers = obstore.get_ranges(               # caller owns the fetch policy:
+    store, "ATL03_...h5",                   # coalescing, concurrency, retries
+    starts=addrs.tolist(),
+    ends=(addrs + sizes).tolist(),
+)
+arr = idx.read_from_buffers(name, buffers, row0, row1)
+# arr is byte-identical to idx.read(name, row0, row1) on a local copy
+```
+
+`buffers` must line up 1:1, in order, with `read_plan`'s chunks; any
+bytes-like objects work (`bytes` is zero-copy, others are copied once).
+`ValueError` is raised on a wrong buffer count or a buffer whose length
+differs from the chunk's stored size; the GIL is released during decode.
+This path removes any dependency on hidefix-side S3 support.
+
 ## Scope and limitations
 
-- Local files only. An S3/object-store read path is future work (upstream
-  range-reader driver, or obstore-fed chunk buffers).
+- The binding itself performs only local-file I/O (`read()`); object-store
+  reads are the caller's job via `read_plan`/`read_from_buffers` above.
 - Filters: gzip (deflate) + shuffle + byte-order — full coverage for ATL03
   and most NASA Earthdata HDF5. Other filters (szip, lzf, scaleoffset) fail
   at index time.
@@ -86,8 +124,17 @@ statically embed compiled hidefix, whose upstream license metadata is
 currently ambiguous: the repository's `LICENSE` file is MIT (added 2023),
 while its `Cargo.toml` / crates.io / PyPI metadata still declare
 `LGPL-3.0-or-later` on every release including 0.12.0. Clarification is
-pending upstream; **the first PyPI release of this package is gated on that
-resolution** (see the workflow note below).
+pending upstream ([gauteh/hidefix#48](https://github.com/gauteh/hidefix/issues/48));
+**the first PyPI release of this package is gated on that resolution** (see
+the workflow note below).
+
+### Private test deployments
+
+Wheels may be staged at a non-public S3 path for internal Lambda testing:
+internal use is not conveyance, so the license gate above does not apply to
+it. Such wheels must **not** be attached to public release artifacts —
+GitHub release zips, mirrors, or PyPI — until the upstream clarification
+resolves.
 
 ## Development
 

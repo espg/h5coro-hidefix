@@ -1,27 +1,31 @@
 //! h5coro-hidefix: compiled companion to h5coro.
 //!
 //! A thin pyo3 binding over the [hidefix](https://crates.io/crates/hidefix)
-//! crate (consumed from crates.io -- no source vendored here). It exposes the
-//! three things the upstream `hidefix` Python binding lacks:
+//! crate (consumed from crates.io -- no source vendored here). It exposes
+//! what the upstream `hidefix` Python binding lacks:
 //!
 //! 1. index save/load (bincode, via hidefix's public serde impls),
 //! 2. chunk enumeration (`(addr, size, offset...)` per chunk),
 //! 3. reads with h5py-compatible semantics: a row-range hyperslab on dim 0
-//!    never squeezes -- a `(1, 5)` request returns shape `(1, 5)`.
+//!    never squeezes -- a `(1, 5)` request returns shape `(1, 5)`,
+//! 4. construction from an external chunk manifest (`Index.from_chunks`),
+//!    so a parquet-primary sidecar store needs no granule file access and
+//!    no durable bincode.
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use hidefix::filters::byteorder::ToNative;
+use hidefix::filters::byteorder::{Order, ToNative};
 use hidefix::idx::{self, DatasetD, DatasetExt, Datatype};
 use hidefix::prelude::{ParReaderExt, ReaderExt};
 use hidefix::reader::cache::CacheReader;
 use numpy::{PyArray1, PyArrayDyn, PyArrayMethods};
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyTuple};
 
 /// Owns a deserialized index together with the buffer it may borrow from.
 ///
@@ -35,6 +39,322 @@ struct Holder {
     /// Never mutated, and the heap allocation address is stable across moves
     /// of the box, so borrows into it stay valid for the holder's lifetime.
     _buf: Option<Box<[u8]>>,
+}
+
+/// Deserialize an index out of an owned buffer, keeping the buffer alive
+/// alongside it (zero-copy chunk tables). Shared by `load()` (bytes from
+/// disk) and `from_chunks()` (bytes from the in-memory shim).
+fn holder_from_bytes(buf: Box<[u8]>, what: &str) -> anyhow::Result<Holder> {
+    // SAFETY: `idx` borrows from the heap allocation behind `buf`. That
+    // allocation's address is stable across moves of the box, the buffer is
+    // never mutated, and `Holder`'s field order guarantees `idx` is dropped
+    // before `buf`. The 'static lifetime never escapes `Holder`.
+    let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+    let idx: idx::Index<'static> =
+        bincode::deserialize(slice).map_err(|e| anyhow!("cannot deserialize index {what}: {e}"))?;
+    Ok(Holder {
+        idx,
+        _buf: Some(buf),
+    })
+}
+
+/// Serialize-side mirrors of hidefix's private `Index`/`GroupIndex` shells.
+///
+/// `Index`/`GroupIndex` cannot be constructed from parts (private fields; the
+/// only constructors walk an open HDF5 file), but their bincode layout is
+/// just field order and types. These shims match that layout exactly --
+/// (path, root) and (path, datasets, groups) -- while the `DatasetD` payload
+/// is built with hidefix's *public* API (`Dataset::new`, `Chunk::new`) and
+/// serialized by hidefix's own serde impls. Serializing a shim and
+/// deserializing through the `load()` path yields a real `Index` without any
+/// file access; the bincode bytes never touch disk.
+#[derive(serde::Serialize)]
+struct GroupShim {
+    path: Option<PathBuf>,
+    datasets: HashMap<String, DatasetD<'static>>,
+    groups: HashMap<String, GroupShim>,
+}
+
+impl GroupShim {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            datasets: HashMap::new(),
+            groups: HashMap::new(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct IndexShim {
+    path: Option<PathBuf>,
+    root: GroupShim,
+}
+
+/// Parse a numpy dtype string (`<f8`, `|i1`, `>u4`, `f8`, or names like
+/// `float64`) into hidefix's datatype + byte order.
+fn parse_dtype(s: &str) -> Option<(Datatype, Order)> {
+    let (order, rest) = match s.as_bytes().first()? {
+        b'<' => (Order::LE, &s[1..]),
+        b'>' => (Order::BE, &s[1..]),
+        b'=' | b'|' => (Order::native(), &s[1..]),
+        _ => (Order::native(), s),
+    };
+    let dt = match rest {
+        "f4" | "float32" => Datatype::Float(4),
+        "f8" | "float64" => Datatype::Float(8),
+        "i1" | "int8" => Datatype::Int(1),
+        "i2" | "int16" => Datatype::Int(2),
+        "i4" | "int32" => Datatype::Int(4),
+        "i8" | "int64" => Datatype::Int(8),
+        "u1" | "uint8" => Datatype::UInt(1),
+        "u2" | "uint16" => Datatype::UInt(2),
+        "u4" | "uint32" => Datatype::UInt(4),
+        "u8" | "uint64" => Datatype::UInt(8),
+        _ => return None,
+    };
+    Some((dt, order))
+}
+
+/// Everything `from_chunks` needs for one dataset, extracted from its dict.
+struct DsSpec {
+    dtype: Datatype,
+    order: Order,
+    shape: Vec<u64>,
+    chunk_shape: Vec<u64>,
+    shuffle: bool,
+    gzip: Option<u8>,
+    addrs: Vec<u64>,
+    sizes: Vec<u64>,
+    offsets: Vec<Vec<u64>>,
+}
+
+fn spec_err(name: &str, msg: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(format!("dataset {name}: {msg}"))
+}
+
+fn req<'py, T: FromPyObject<'py>>(d: &Bound<'py, PyDict>, name: &str, key: &str) -> PyResult<T> {
+    d.get_item(key)?
+        .filter(|v| !v.is_none())
+        .ok_or_else(|| spec_err(name, format!("missing required key '{key}'")))?
+        .extract::<T>()
+        .map_err(|e| spec_err(name, format!("invalid '{key}': {e}")))
+}
+
+fn parse_spec(name: &str, d: &Bound<'_, PyDict>) -> PyResult<DsSpec> {
+    let dtype_s: String = req(d, name, "dtype")?;
+    let (dtype, order) = parse_dtype(&dtype_s)
+        .ok_or_else(|| spec_err(name, format!("unsupported dtype '{dtype_s}'")))?;
+    let shape: Vec<u64> = req(d, name, "shape")?;
+    let chunk_shape: Vec<u64> = req(d, name, "chunk_shape")?;
+    let shuffle: bool = req(d, name, "shuffle")?;
+    let gzip_item = d
+        .get_item("gzip")?
+        .ok_or_else(|| spec_err(name, "missing required key 'gzip'"))?;
+    let gzip: Option<u8> = if gzip_item.is_none() {
+        None
+    } else if gzip_item.is_instance_of::<PyBool>() {
+        return Err(spec_err(
+            name,
+            "'gzip' must be a deflate level (0-9) or None, not a bool",
+        ));
+    } else {
+        let level: u8 = gzip_item
+            .extract()
+            .map_err(|e| spec_err(name, format!("invalid 'gzip': {e}")))?;
+        if level > 9 {
+            return Err(spec_err(name, format!("invalid deflate level {level}")));
+        }
+        Some(level)
+    };
+    let addrs: Vec<u64> = req(d, name, "addrs")?;
+    let sizes: Vec<u64> = req(d, name, "sizes")?;
+    let offsets: Vec<Vec<u64>> = req(d, name, "offsets")?;
+
+    let ndim = shape.len();
+    if ndim == 0 || ndim > 9 {
+        return Err(spec_err(name, format!("rank {ndim} unsupported (1-9)")));
+    }
+    if chunk_shape.len() != ndim {
+        return Err(spec_err(
+            name,
+            format!(
+                "chunk_shape rank {} != shape rank {ndim}",
+                chunk_shape.len()
+            ),
+        ));
+    }
+    if chunk_shape.contains(&0) {
+        return Err(spec_err(name, "chunk_shape entries must be nonzero"));
+    }
+    let k = addrs.len();
+    if sizes.len() != k || offsets.len() != k {
+        return Err(spec_err(
+            name,
+            format!(
+                "chunk table length mismatch: addrs {k}, sizes {}, offsets {}",
+                sizes.len(),
+                offsets.len()
+            ),
+        ));
+    }
+    if let Some(fm_item) = d.get_item("filter_mask")? {
+        if !fm_item.is_none() {
+            let masks: Vec<u64> = fm_item
+                .extract()
+                .map_err(|e| spec_err(name, format!("invalid 'filter_mask': {e}")))?;
+            if masks.len() != k {
+                return Err(spec_err(
+                    name,
+                    format!("filter_mask length {} != chunk count {k}", masks.len()),
+                ));
+            }
+            if let Some(i) = masks.iter().position(|&m| m != 0) {
+                return Err(spec_err(
+                    name,
+                    format!(
+                        "chunk {i} has nonzero filter_mask {}; hidefix's chunk model \
+                         cannot represent per-chunk filter masks",
+                        masks[i]
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(DsSpec {
+        dtype,
+        order,
+        shape,
+        chunk_shape,
+        shuffle,
+        gzip,
+        addrs,
+        sizes,
+        offsets,
+    })
+}
+
+/// Build the concrete `Dataset<'static, D>` from a validated spec.
+fn build_dataset_d<const D: usize>(
+    name: &str,
+    spec: &DsSpec,
+) -> PyResult<idx::Dataset<'static, D>> {
+    let shape: [u64; D] = spec.shape.as_slice().try_into().expect("rank checked");
+    let chunk_shape: [u64; D] = spec
+        .chunk_shape
+        .as_slice()
+        .try_into()
+        .expect("rank checked");
+    let mut chunks: Vec<idx::Chunk<D>> = Vec::with_capacity(spec.addrs.len());
+    for (i, ((&addr, &size), off)) in spec
+        .addrs
+        .iter()
+        .zip(&spec.sizes)
+        .zip(&spec.offsets)
+        .enumerate()
+    {
+        let off: [u64; D] = off.as_slice().try_into().map_err(|_| {
+            spec_err(
+                name,
+                format!("offsets row {i} has {} entries, expected {D}", off.len()),
+            )
+        })?;
+        for d in 0..D {
+            if !off[d].is_multiple_of(chunk_shape[d]) || (shape[d] > 0 && off[d] >= shape[d]) {
+                return Err(spec_err(
+                    name,
+                    format!(
+                        "chunk {i} offset {off:?} is not a chunk-aligned position \
+                         inside shape {shape:?} (chunk_shape {chunk_shape:?})"
+                    ),
+                ));
+            }
+        }
+        chunks.push(idx::Chunk::new(addr, size, off));
+    }
+    chunks.sort();
+    if let Some(w) = chunks.windows(2).find(|w| w[0].cmp(&w[1]).is_eq()) {
+        return Err(spec_err(
+            name,
+            format!("duplicate chunk offset {:?}", w[0].offset_u64()),
+        ));
+    }
+    let expected: u64 = shape
+        .iter()
+        .zip(&chunk_shape)
+        .map(|(s, c)| s.div_ceil(*c))
+        .product();
+    if chunks.len() as u64 != expected {
+        return Err(spec_err(
+            name,
+            format!(
+                "chunk table has {} rows but shape {shape:?} / chunk_shape \
+                 {chunk_shape:?} requires {expected}",
+                chunks.len()
+            ),
+        ));
+    }
+    idx::Dataset::new(
+        spec.dtype,
+        spec.order,
+        shape,
+        chunks,
+        chunk_shape,
+        spec.shuffle,
+        spec.gzip,
+    )
+    .map_err(|e| spec_err(name, e))
+}
+
+fn build_dataset(name: &str, spec: &DsSpec) -> PyResult<DatasetD<'static>> {
+    Ok(match spec.shape.len() {
+        1 => DatasetD::D1(build_dataset_d::<1>(name, spec)?),
+        2 => DatasetD::D2(build_dataset_d::<2>(name, spec)?),
+        3 => DatasetD::D3(build_dataset_d::<3>(name, spec)?),
+        4 => DatasetD::D4(build_dataset_d::<4>(name, spec)?),
+        5 => DatasetD::D5(build_dataset_d::<5>(name, spec)?),
+        6 => DatasetD::D6(build_dataset_d::<6>(name, spec)?),
+        7 => DatasetD::D7(build_dataset_d::<7>(name, spec)?),
+        8 => DatasetD::D8(build_dataset_d::<8>(name, spec)?),
+        9 => DatasetD::D9(build_dataset_d::<9>(name, spec)?),
+        n => return Err(spec_err(name, format!("rank {n} unsupported (1-9)"))),
+    })
+}
+
+/// Insert a dataset at its full path, creating intermediate group shims.
+fn insert_dataset(
+    root: &mut GroupShim,
+    source: &Path,
+    path: &str,
+    dsd: DatasetD<'static>,
+) -> PyResult<()> {
+    let mut parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let ds_name = match parts.pop() {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "invalid dataset path: '{path}'"
+            )))
+        }
+    };
+    let mut group = root;
+    for part in parts {
+        if part.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "invalid dataset path: '{path}'"
+            )));
+        }
+        group = group
+            .groups
+            .entry(part.to_string())
+            .or_insert_with(|| GroupShim::new(Some(source.to_path_buf())));
+    }
+    if group.datasets.insert(ds_name.to_string(), dsd).is_some() {
+        return Err(PyValueError::new_err(format!(
+            "duplicate dataset path: '{path}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Run `$body` with `$ds` bound to the concrete `Dataset<'_, D>` inside a
@@ -373,27 +693,53 @@ impl Index {
     fn load(py: Python<'_>, path: PathBuf, source: Option<PathBuf>) -> PyResult<Self> {
         let (holder, embedded) = py.allow_threads(|| -> anyhow::Result<_> {
             let buf = std::fs::read(&path)?.into_boxed_slice();
-            // SAFETY: `idx` borrows from the heap allocation behind `buf`.
-            // That allocation's address is stable across moves of the box, the
-            // buffer is never mutated, and `Holder`'s field order guarantees
-            // `idx` is dropped before `buf`. The 'static lifetime never
-            // escapes `Holder`.
-            let slice: &'static [u8] =
-                unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
-            let idx: idx::Index<'static> = bincode::deserialize(slice)
-                .map_err(|e| anyhow!("cannot deserialize index {}: {e}", path.display()))?;
-            let embedded = idx.path().map(|p| p.to_path_buf());
-            Ok((
-                Holder {
-                    idx,
-                    _buf: Some(buf),
-                },
-                embedded,
-            ))
+            let holder = holder_from_bytes(buf, &path.display().to_string())?;
+            let embedded = holder.idx.path().map(|p| p.to_path_buf());
+            Ok((holder, embedded))
         })?;
         Ok(Self {
             holder: Arc::new(holder),
             source: source.or(embedded),
+        })
+    }
+
+    /// from_chunks(source, datasets)
+    ///
+    /// Construct a decode-capable index from an externally-supplied chunk
+    /// manifest -- no granule file access, no stored bincode. ``source`` is
+    /// the path reads resolve against (may not exist locally when only
+    /// ``read_plan``/``read_from_buffers`` are used). ``datasets`` maps full
+    /// dataset paths to dicts with keys: ``dtype`` (numpy str), ``shape``,
+    /// ``chunk_shape``, ``gzip`` (deflate level or None), ``shuffle``
+    /// (bool), ``addrs`` (u64[k]), ``sizes`` (u64[k]), ``offsets``
+    /// (u64[k, ndim]), and optionally ``filter_mask`` (must be all zero).
+    /// Chunk rows need not be pre-sorted. The result behaves exactly like an
+    /// index built from the file: ``read``/``read_plan``/
+    /// ``read_from_buffers``/``save``/``chunks`` all work unchanged.
+    #[staticmethod]
+    fn from_chunks(source: PathBuf, datasets: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let mut root = GroupShim::new(Some(source.clone()));
+        for (key, value) in datasets.iter() {
+            let name: String = key
+                .extract()
+                .map_err(|_| PyValueError::new_err("dataset keys must be str paths"))?;
+            let spec_dict = value.downcast::<PyDict>().map_err(|_| {
+                PyValueError::new_err(format!("dataset {name}: value must be a dict"))
+            })?;
+            let spec = parse_spec(&name, spec_dict)?;
+            let dsd = build_dataset(&name, &spec)?;
+            insert_dataset(&mut root, &source, &name, dsd)?;
+        }
+        let shim = IndexShim {
+            path: Some(source.clone()),
+            root,
+        };
+        let bytes = bincode::serialize(&shim)
+            .map_err(|e| PyValueError::new_err(format!("cannot encode index: {e}")))?;
+        let holder = holder_from_bytes(bytes.into_boxed_slice(), "built by from_chunks")?;
+        Ok(Self {
+            holder: Arc::new(holder),
+            source: Some(source),
         })
     }
 
@@ -443,6 +789,30 @@ impl Index {
     /// Numpy dtype name (native byte order after read), e.g. ``float64``.
     fn dtype(&self, dataset: &str) -> PyResult<&'static str> {
         dtype_str(self.dataset(dataset)?.dtype())
+    }
+
+    /// filters(dataset) -> dict
+    ///
+    /// The dataset's filter chain and storage byte order:
+    /// ``{"gzip": int | None, "shuffle": bool, "byte_order": "little" |
+    /// "big" | "unknown"}``. Together with ``datasets()``, ``shape()``,
+    /// ``chunk_shape()``, ``dtype()`` and ``chunks()`` this is everything an
+    /// extractor needs to produce ``from_chunks()`` input from a real index.
+    fn filters(&self, py: Python<'_>, dataset: &str) -> PyResult<Py<PyAny>> {
+        let dsd = self.dataset(dataset)?;
+        let (gzip, shuffle, order) = with_dataset!(dsd, ds => (ds.gzip, ds.shuffle, ds.order));
+        let d = PyDict::new(py);
+        d.set_item("gzip", gzip)?;
+        d.set_item("shuffle", shuffle)?;
+        d.set_item(
+            "byte_order",
+            match order {
+                Order::BE => "big",
+                Order::LE => "little",
+                Order::Unknown => "unknown",
+            },
+        )?;
+        Ok(d.into_any().unbind())
     }
 
     /// chunks(dataset) -> (addrs, sizes, offsets)

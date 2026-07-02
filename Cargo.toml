@@ -1,0 +1,32 @@
+[package]
+name = "h5coro-hidefix"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Compiled companion to h5coro: hidefix-backed HDF5 chunk indexing, index save/load, chunk enumeration, and fast hyperslab reads"
+repository = "https://github.com/espg/h5coro-hidefix"
+readme = "README.md"
+
+[lib]
+name = "h5coro_hidefix"
+crate-type = ["cdylib"]
+
+[dependencies]
+# hidefix comes from crates.io -- no source is vendored into this tree.
+# Features: "static" builds and bundles libhdf5 (hdf5-metno-src, needs cmake at
+# build time) so wheels carry no system libhdf5 dependency; gzip (libdeflater),
+# shuffle, and byteorder decode are unconditional in hidefix. We deliberately
+# exclude: "netcdf" (unneeded reader + big native dep), "python" /
+# "extension-module" (that is upstream's own binding; this crate is its
+# replacement), "clap" (CLI only). Index serde impls are always compiled in, so
+# no hidefix feature is needed for serialization -- we depend on bincode directly.
+hidefix = { version = "0.12", default-features = false, features = ["static"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39", "anyhow"] }
+numpy = "0.23"
+bincode = "1"
+anyhow = "1"
+byte-slice-cast = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

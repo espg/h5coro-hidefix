@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "h5coro-hidefix"
+description = "Compiled companion to h5coro: hidefix-backed HDF5 chunk indexing, index save/load, chunk enumeration, and fast hyperslab reads"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Shane Grigsby", email = "refuge@rocktalus.com" }]
+dependencies = ["numpy>=1.21"]
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Repository = "https://github.com/espg/h5coro-hidefix"
+
+[project.optional-dependencies]
+test = ["pytest>=7", "h5py>=3.8"]
+
+[tool.maturin]
+module-name = "h5coro_hidefix"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

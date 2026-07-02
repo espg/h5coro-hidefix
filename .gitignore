@@ -1,0 +1,12 @@
+/target
+/dist
+/dist-*
+*.so
+*.pyd
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.DS_Store

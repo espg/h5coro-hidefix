@@ -36,8 +36,16 @@ This binding fixes all three while keeping the surface minimal:
   itself and hands the raw stored bytes back for decode + assembly,
   byte-identical to `read()`. No file or network access happens inside the
   binding.
+- `Index.from_chunks(source, datasets)` — construct a decode-capable index
+  from an **external chunk manifest** (e.g. rows from a parquet sidecar
+  store): no granule file access, no stored bincode. `Index.filters(dataset)`
+  (`{"gzip": int|None, "shuffle": bool, "byte_order": ...}`) completes the
+  extraction side, so `Index(path)` → getters → `from_chunks` round-trips
+  byte-identically.
 
-Design discussion: [englacial/zagg#155](https://github.com/englacial/zagg/issues/155).
+Design discussion: [englacial/zagg#155](https://github.com/englacial/zagg/issues/155),
+[englacial/zagg#160](https://github.com/englacial/zagg/issues/160)
+(parquet-primary sidecar store).
 
 ## Install
 
@@ -103,6 +111,49 @@ bytes-like objects work (`bytes` is zero-copy, others are copied once).
 `ValueError` is raised on a wrong buffer count or a buffer whose length
 differs from the chunk's stored size; the GIL is released during decode.
 This path removes any dependency on hidefix-side S3 support.
+
+## Manifest-built indices: `from_chunks` (parquet-primary store)
+
+When the chunk manifest lives in a durable store (parquet sidecars — see
+englacial/zagg#160), the index is reconstructed from it on demand; the
+granule file is never opened and no bincode is ever stored:
+
+```python
+# caller side: read the manifest (pyarrow / obstore) -- this package stays
+# numpy-only at runtime, so parquet decoding happens outside it
+idx = hx.Index.from_chunks("s3-key-or-local-path.h5", {
+    "/gt1l/heights/h_ph": dict(
+        dtype="<f8",              # numpy dtype str; byte order honored
+        shape=(23_692_855,),
+        chunk_shape=(100_000,),
+        gzip=6,                   # deflate level or None
+        shuffle=True,
+        addrs=addrs,              # u64[k]   chunk byte offsets in the file
+        sizes=sizes,              # u64[k]   stored (compressed) byte counts
+        offsets=offsets,          # u64[k, ndim] dataspace chunk coordinates
+        filter_mask=masks,        # optional; must be all zero (see below)
+    ),
+    ...
+})
+arr = idx.read_from_buffers(name, buffers, row0, row1)  # as above
+```
+
+Chunk rows need not be pre-sorted. The result is a real index — `read`,
+`read_plan`, `read_from_buffers`, `save`, `chunks` all behave exactly as if
+it had been built from the file.
+
+**Metadata contract for extractors** (what a manifest must carry, per
+dataset): `dtype`, `shape`, `chunk_shape`, `gzip`, `shuffle`, plus the chunk
+table (`addrs`, `sizes`, and per-chunk dataspace `offsets` — for 1-D data
+the offset equals the element start index; for N-D it must be stored
+explicitly). All of it is available from a real index via `datasets()`,
+`shape()`, `chunk_shape()`, `dtype()`, `filters()` and `chunks()`.
+
+**Per-chunk filter masks are unrepresentable**: hidefix models filters at
+dataset level (`shuffle`, `gzip`), and its chunk records carry only
+`(addr, size, offset)`. A nonzero HDF5 `filter_mask` (bit i = filter i
+skipped for that chunk) therefore raises `ValueError` in `from_chunks`.
+ATL03 masks are all zero (verified in englacial/zagg PR #159).
 
 ## Scope and limitations
 

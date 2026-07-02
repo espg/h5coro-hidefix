@@ -1,0 +1,91 @@
+name: wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: ubuntu-24.04-arm # native arm64 runner, no QEMU
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --locked
+          manylinux: "2_28"
+          # hidefix's "static" feature compiles and bundles libhdf5
+          # (hdf5-metno-src), which needs cmake inside the manylinux image.
+          before-script-linux: dnf install -y cmake
+      - name: Smoke-test wheel
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install dist/*.whl pytest h5py numpy
+          venv/bin/python -m pytest tests/test_hermetic.py -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64-apple-darwin
+          args: --release --out dist --locked
+      - name: Smoke-test wheel
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install dist/*.whl pytest h5py numpy
+          venv/bin/python -m pytest tests/test_hermetic.py -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-arm64
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  # PyPI publish via Trusted Publishing (no secret in this repo). The
+  # `h5coro-hidefix` name is not registered on PyPI yet, and the first
+  # release is additionally gated on the upstream hidefix license
+  # clarification (see README) -- until both are resolved this job simply
+  # fails harmlessly on tag pushes.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, macos, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

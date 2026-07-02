@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust lint
+        run: |
+          cargo fmt --check
+          cargo clippy --locked -- -D warnings
+      - name: Build and install (compiles bundled static libhdf5; needs cmake)
+        run: pip install -v ".[test]"
+      - name: Hermetic tests
+        run: pytest tests/test_hermetic.py -v

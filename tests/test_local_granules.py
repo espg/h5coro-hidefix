@@ -91,3 +91,21 @@ def test_chunks_match_h5py(idx, granule):
             j = j[0]
             assert sizes[j] == info.size
             assert tuple(offsets[j]) == tuple(info.chunk_offset)
+
+
+def test_read_from_buffers_matches_read(idx, granule):
+    """Simulated obstore flow: read_plan -> ranged reads -> read_from_buffers."""
+    for name in _present(idx):
+        n = idx.shape(name)[0]
+        for start, end in [(0, 1), (n // 3, n // 3 + 100_000), (n - 7, n), (5, 5)]:
+            addrs, sizes, _ = idx.read_plan(name, start, end)
+            with open(granule, "rb") as f:
+                buffers = []
+                for addr, size in zip(addrs, sizes):
+                    f.seek(int(addr))
+                    buffers.append(f.read(int(size)))
+            got = idx.read_from_buffers(name, buffers, start, end)
+            via_read = idx.read(name, start, end)
+            assert got.shape == via_read.shape
+            assert got.dtype == via_read.dtype
+            assert got.tobytes() == via_read.tobytes()

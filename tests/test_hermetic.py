@@ -166,6 +166,103 @@ def test_load_garbage_raises(tmp_path):
         Index.load(p)
 
 
+def _fetch(h5file, addrs, sizes):
+    """Simulate the object-store fetch: ranged reads from the local file."""
+    out = []
+    with open(h5file, "rb") as f:
+        for addr, size in zip(addrs, sizes):
+            f.seek(int(addr))
+            out.append(f.read(int(size)))
+    return out
+
+
+@pytest.mark.parametrize(
+    "start,end",
+    [
+        (None, None),  # full dataset
+        (0, 1),
+        (1, CHUNK + 1),  # crosses a chunk boundary
+        (CHUNK - 1, CHUNK + 1),
+        (2_500, 7_501),
+        (N - CHUNK - 3, N),  # includes the partial final region
+        (7, 7),  # empty range -> zero chunks, zero buffers
+    ],
+)
+def test_read_from_buffers_matches_read(idx, ref, h5file, start, end):
+    for name in DSETS[:3]:  # 1-D f8 and 2-D (n, 5) i1
+        addrs, sizes, offsets = idx.read_plan(name, start, end)
+        assert len(addrs) == len(sizes) == len(offsets)
+        buffers = _fetch(h5file, addrs, sizes)
+        got = idx.read_from_buffers(name, buffers, start, end)
+        via_read = idx.read(name, start, end)
+        expect = ref[name][start:end]
+        assert got.shape == via_read.shape == expect.shape
+        assert got.dtype == via_read.dtype == expect.dtype
+        assert got.tobytes() == via_read.tobytes() == expect.tobytes()
+
+
+def test_read_from_buffers_contiguous(idx, ref, h5file):
+    """The contiguous (single pseudo-chunk, unfiltered) dataset round-trips."""
+    name = "/meta/plain"
+    for start, end in [(None, None), (0, 1), (5, 20), (36, 37), (3, 3)]:
+        addrs, sizes, _ = idx.read_plan(name, start, end)
+        buffers = _fetch(h5file, addrs, sizes)
+        got = idx.read_from_buffers(name, buffers, start, end)
+        assert got.tobytes() == ref[name][start:end].tobytes()
+
+
+def test_read_plan_subsets_chunks(idx):
+    name = "/gt1l/heights/signal_conf_ph"
+    all_addrs, all_sizes, all_offsets = idx.chunks(name)
+    addrs, sizes, offsets = idx.read_plan(name, CHUNK, 3 * CHUNK)
+    assert len(addrs) == 2  # rows [CHUNK, 3*CHUNK) -> exactly chunks 1 and 2
+    np.testing.assert_array_equal(addrs, all_addrs[1:3])
+    np.testing.assert_array_equal(sizes, all_sizes[1:3])
+    np.testing.assert_array_equal(offsets, all_offsets[1:3])
+    # empty range plans no chunks
+    addrs, sizes, offsets = idx.read_plan(name, 5, 5)
+    assert len(addrs) == 0 and offsets.shape == (0, 2)
+
+
+def test_read_from_buffers_accepts_bytes_like(idx, ref, h5file):
+    name = "/gt1l/heights/h_ph"
+    addrs, sizes, _ = idx.read_plan(name, 0, CHUNK)
+    (buf,) = _fetch(h5file, addrs, sizes)
+    expect = ref[name][:CHUNK].tobytes()
+    for wrap in (bytes, bytearray, memoryview):
+        got = idx.read_from_buffers(name, [wrap(buf)], 0, CHUNK)
+        assert got.tobytes() == expect
+
+
+def test_read_from_buffers_wrong_count(idx, h5file):
+    name = "/gt1l/heights/h_ph"
+    addrs, sizes, _ = idx.read_plan(name, 0, 2 * CHUNK)
+    buffers = _fetch(h5file, addrs, sizes)
+    with pytest.raises(ValueError, match="expected 2 buffers"):
+        idx.read_from_buffers(name, buffers[:1], 0, 2 * CHUNK)
+    with pytest.raises(ValueError, match="expected 2 buffers"):
+        idx.read_from_buffers(name, buffers + buffers[:1], 0, 2 * CHUNK)
+
+
+def test_read_from_buffers_wrong_size(idx, h5file):
+    name = "/gt1l/heights/h_ph"
+    addrs, sizes, _ = idx.read_plan(name, 0, CHUNK)
+    (buf,) = _fetch(h5file, addrs, sizes)
+    with pytest.raises(ValueError, match="stores"):
+        idx.read_from_buffers(name, [buf[:-1]], 0, CHUNK)
+    with pytest.raises(ValueError, match="not bytes-like"):
+        idx.read_from_buffers(name, [12345], 0, CHUNK)
+
+
+def test_read_from_buffers_corrupted(idx, h5file):
+    name = "/gt1l/heights/h_ph"
+    addrs, sizes, _ = idx.read_plan(name, 0, CHUNK)
+    (buf,) = _fetch(h5file, addrs, sizes)
+    corrupted = bytes(len(buf))  # right length, garbage (invalid deflate)
+    with pytest.raises(Exception):
+        idx.read_from_buffers(name, [corrupted], 0, CHUNK)
+
+
 def test_read_with_missing_source_raises(idx, tmp_path):
     p = tmp_path / "index.bin"
     idx.save(p)

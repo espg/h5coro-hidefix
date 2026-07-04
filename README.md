@@ -50,7 +50,7 @@ Design discussion: [englacial/zagg#155](https://github.com/englacial/zagg/issues
 ## Install
 
 ```sh
-pip install h5coro-hidefix        # once published; not yet registered on PyPI
+pip install h5coro-hidefix
 ```
 
 Or from source (needs a Rust toolchain and `cmake` — the bundled static
@@ -126,7 +126,7 @@ idx = hx.Index.from_chunks("s3-key-or-local-path.h5", {
         dtype="<f8",              # numpy dtype str; byte order honored
         shape=(23_692_855,),
         chunk_shape=(100_000,),
-        gzip=6,                   # deflate level or None
+        gzip=6,                   # deflate level, bool, or None (see below)
         shuffle=True,
         addrs=addrs,              # u64[k]   chunk byte offsets in the file
         sizes=sizes,              # u64[k]   stored (compressed) byte counts
@@ -143,10 +143,12 @@ Chunk rows need not be pre-sorted. The result is a real index — `read`,
 it had been built from the file.
 
 **Metadata contract for extractors** (what a manifest must carry, per
-dataset): `dtype`, `shape`, `chunk_shape`, `gzip`, `shuffle`, plus the chunk
-table (`addrs`, `sizes`, and per-chunk dataspace `offsets` — for 1-D data
-the offset equals the element start index; for N-D it must be stored
-explicitly). All of it is available from a real index via `datasets()`,
+dataset): `dtype`, `shape`, `chunk_shape`, `gzip` (**level int | bool |
+null** — manifests that cannot see the deflate level, e.g. h5coro's
+metadata parse, may emit a boolean: decode only checks presence, so `True`
+records a placeholder level), `shuffle`, plus the chunk table (`addrs`,
+`sizes`, and per-chunk dataspace `offsets` — for 1-D data the offset equals
+the element start index; for N-D it must be stored explicitly). All of it is available from a real index via `datasets()`,
 `shape()`, `chunk_shape()`, `dtype()`, `filters()` and `chunks()`.
 
 **Per-chunk filter masks are unrepresentable**: hidefix models filters at
@@ -168,24 +170,22 @@ ATL03 masks are all zero (verified in englacial/zagg PR #159).
   types — treat it as an opaque cache keyed by (file, hidefix version), not
   as a stable interchange format.
 
-## Licensing note
+## Licensing
 
-The binding code in this repository is MIT. Published wheels, however,
-statically embed compiled hidefix, whose upstream license metadata is
-currently ambiguous: the repository's `LICENSE` file is MIT (added 2023),
-while its `Cargo.toml` / crates.io / PyPI metadata still declare
-`LGPL-3.0-or-later` on every release including 0.12.0. Clarification is
-pending upstream ([gauteh/hidefix#48](https://github.com/gauteh/hidefix/issues/48));
-**the first PyPI release of this package is gated on that resolution** (see
-the workflow note below).
+The binding code in this repository is MIT. Published wheels statically
+embed third-party components; their license texts ship inside the wheel
+(`*.dist-info/licenses/`):
 
-### Private test deployments
+- **hidefix** — MIT, Copyright 2023 Gaute Hope (`LICENSE-hidefix`). The
+  earlier upstream metadata ambiguity is resolved: MIT was confirmed in
+  [gauteh/hidefix#48](https://github.com/gauteh/hidefix/issues/48) and the
+  stale `Cargo.toml` field fixed in
+  [gauteh/hidefix#49](https://github.com/gauteh/hidefix/pull/49).
+- **HDF5**, built and bundled by `hdf5-metno-src` — The HDF Group's
+  BSD-style license (`LICENSE-hdf5`).
 
-Wheels may be staged at a non-public S3 path for internal Lambda testing:
-internal use is not conveyance, so the license gate above does not apply to
-it. Such wheels must **not** be attached to public release artifacts —
-GitHub release zips, mirrors, or PyPI — until the upstream clarification
-resolves.
+Remaining statically-linked Rust dependencies are MIT/Apache-2.0
+dual-licensed or similarly permissive.
 
 ## Development
 
@@ -202,7 +202,5 @@ with `H5CORO_HIDEFIX_GRANULE_DIR`).
 
 CI builds wheels for manylinux x86_64 + aarch64 (static libhdf5, `cmake`
 installed in the manylinux image) and macOS arm64, abi3 (`>=3.9`), one wheel
-per platform. The publish job triggers on version tags and uses PyPI Trusted
-Publishing — it will fail harmlessly until the `h5coro-hidefix` name is
-registered on PyPI and the trusted publisher is configured (and stays gated
-on the licensing note above).
+per platform. The publish job triggers on version tags and publishes to PyPI
+via Trusted Publishing.

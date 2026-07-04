@@ -440,8 +440,10 @@ def test_from_chunks_errors(idx, h5file):
     dup_offsets[1] = dup_offsets[0]
     with pytest.raises(ValueError, match="duplicate"):
         Index.from_chunks(h5file, variant(offsets=dup_offsets))
-    with pytest.raises(ValueError, match="bool"):
-        Index.from_chunks(h5file, variant(gzip=True))
+    with pytest.raises(ValueError, match="gzip"):
+        Index.from_chunks(h5file, variant(gzip="deflate"))
+    with pytest.raises(ValueError, match="deflate level"):
+        Index.from_chunks(h5file, variant(gzip=42))
     with pytest.raises(ValueError, match="filter_mask"):
         Index.from_chunks(h5file, variant(filter_mask=[0] * (len(base["addrs"]) - 1)))
     mask = [0] * len(base["addrs"])
@@ -452,3 +454,30 @@ def test_from_chunks_errors(idx, h5file):
         Index.from_chunks(h5file, {name: 42})
     with pytest.raises(ValueError, match="invalid dataset path"):
         Index.from_chunks(h5file, {"///": dict(base)})
+
+
+def test_from_chunks_gzip_bool(idx, ref, h5file):
+    """Manifests that cannot see the deflate level emit gzip as a bool
+    (e.g. zagg write-back via h5coro's metadata parse); decode only checks
+    presence. True on a real gzip'd dataset must decode byte-identically."""
+    name = "/gt1l/heights/h_ph"  # written with gzip level 6 + shuffle
+    meta = _extract_meta(idx, [name])
+    meta[name]["gzip"] = True
+    v = Index.from_chunks(h5file, meta)
+    assert v.filters(name)["gzip"] is not None  # presence, placeholder level
+    for start, end in [(None, None), (CHUNK - 1, CHUNK + 1)]:
+        got = v.read(name, start, end)
+        assert got.tobytes() == ref[name][start:end].tobytes()
+    addrs, sizes, _ = v.read_plan(name, 0, 2 * CHUNK)
+    buffers = _fetch(h5file, addrs, sizes)
+    got = v.read_from_buffers(name, buffers, 0, 2 * CHUNK)
+    assert got.tobytes() == ref[name][: 2 * CHUNK].tobytes()
+
+    # False on an uncompressed dataset is equivalent to None
+    name = "/meta/plain"
+    meta = _extract_meta(idx, [name])
+    assert meta[name]["gzip"] is None
+    meta[name]["gzip"] = False
+    v = Index.from_chunks(h5file, meta)
+    assert v.filters(name)["gzip"] is None
+    assert v.read(name).tobytes() == ref[name].tobytes()

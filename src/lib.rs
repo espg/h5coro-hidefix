@@ -154,14 +154,23 @@ fn parse_spec(name: &str, d: &Bound<'_, PyDict>) -> PyResult<DsSpec> {
     let gzip: Option<u8> = if gzip_item.is_none() {
         None
     } else if gzip_item.is_instance_of::<PyBool>() {
-        return Err(spec_err(
-            name,
-            "'gzip' must be a deflate level (0-9) or None, not a bool",
-        ));
+        // Manifests that cannot see the deflate level (e.g. zagg write-back
+        // via h5coro's metadata parse) emit a boolean; decode only checks
+        // presence, so `True` stores a placeholder level (6) that is not
+        // meaningful. Must be tested before the int branch: bool is a
+        // Python int subclass.
+        if gzip_item.extract::<bool>()? {
+            Some(6)
+        } else {
+            None
+        }
     } else {
-        let level: u8 = gzip_item
-            .extract()
-            .map_err(|e| spec_err(name, format!("invalid 'gzip': {e}")))?;
+        let level: u8 = gzip_item.extract().map_err(|_| {
+            spec_err(
+                name,
+                "'gzip' must be a deflate level (0-9), a bool, or None",
+            )
+        })?;
         if level > 9 {
             return Err(spec_err(name, format!("invalid deflate level {level}")));
         }
@@ -710,7 +719,9 @@ impl Index {
     /// the path reads resolve against (may not exist locally when only
     /// ``read_plan``/``read_from_buffers`` are used). ``datasets`` maps full
     /// dataset paths to dicts with keys: ``dtype`` (numpy str), ``shape``,
-    /// ``chunk_shape``, ``gzip`` (deflate level or None), ``shuffle``
+    /// ``chunk_shape``, ``gzip`` (deflate level, bool, or None -- a bare
+    /// ``True`` records presence with a placeholder level, since decode
+    /// only checks presence), ``shuffle``
     /// (bool), ``addrs`` (u64[k]), ``sizes`` (u64[k]), ``offsets``
     /// (u64[k, ndim]), and optionally ``filter_mask`` (must be all zero).
     /// Chunk rows need not be pre-sorted. The result behaves exactly like an

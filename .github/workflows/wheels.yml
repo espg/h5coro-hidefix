@@ -71,11 +71,8 @@ jobs:
           name: wheels-sdist
           path: dist
 
-  # PyPI publish via Trusted Publishing (no secret in this repo). The
-  # `h5coro-hidefix` name is not registered on PyPI yet, and the first
-  # release is additionally gated on the upstream hidefix license
-  # clarification (see README) -- until both are resolved this job simply
-  # fails harmlessly on tag pushes.
+  # PyPI publish via Trusted Publishing (no secret in this repo); runs on
+  # version-tag pushes.
   publish:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [linux, macos, sdist]

@@ -42,6 +42,26 @@ This binding fixes all three while keeping the surface minimal:
   (`{"gzip": int|None, "shuffle": bool, "byte_order": ...}`) completes the
   extraction side, so `Index(path)` → getters → `from_chunks` round-trips
   byte-identically.
+- **zagg `sidecar` backend** (`h5coro_hidefix.zagg_backend.SidecarIndex`) —
+  registered under the `zagg.index_backends` entry-point group, so a zagg
+  environment with this wheel installed discovers it automatically:
+
+  ```yaml
+  data_source:
+    index:
+      backend: sidecar
+      store: s3://bucket/zagg-index/ATL03/007/
+      on_miss: fallback      # fallback | error | build
+  ```
+
+  Selection uses zagg's shared planned route; addressing reconstructs the
+  granule's index from `<store>/<granule_id>.parquet` (zagg's inline
+  write-back manifest schema) via `from_chunks`, fetches exactly the needed
+  chunk ranges through the worker's own credentialed h5coro driver, and
+  decodes with `read_from_buffers`. Written against the zagg virtual-index
+  protocol at englacial/zagg PR #163 head `87b941e` (see the module
+  docstring). Importing `h5coro_hidefix` alone never pulls zagg/pandas —
+  the backend module is only imported by zagg's entry-point discovery.
 
 Design discussion: [englacial/zagg#155](https://github.com/englacial/zagg/issues/155),
 [englacial/zagg#160](https://github.com/englacial/zagg/issues/160)

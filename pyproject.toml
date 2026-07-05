@@ -20,14 +20,20 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
+[project.entry-points."zagg.index_backends"]
+sidecar = "h5coro_hidefix.zagg_backend:SidecarIndex"
+
 [project.urls]
 Repository = "https://github.com/espg/h5coro-hidefix"
 
 [project.optional-dependencies]
-test = ["pytest>=7", "h5py>=3.8"]
+test = ["pytest>=7", "h5py>=3.8", "pandas>=2", "pyarrow>=14"]
 
 [tool.maturin]
-module-name = "h5coro_hidefix"
+# Mixed Rust/Python layout: the compiled core is h5coro_hidefix._native;
+# the python package under python/ re-exports it and adds the zagg backend.
+module-name = "h5coro_hidefix._native"
+python-source = "python"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -975,6 +975,7 @@ impl Index {
 }
 
 #[pymodule]
+#[pyo3(name = "_native")]
 fn h5coro_hidefix(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Index>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

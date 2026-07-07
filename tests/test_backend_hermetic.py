@@ -284,6 +284,121 @@ class TestProtocolShape:
             assert pooled(path, hs).tobytes() == serial(path, hs).tobytes()
         assert len(_JitteredH5.calls) > 0
 
+    def test_fetch_budget_caps_concurrent_gets(
+        self, sidecar_cls, idx, h5file, monkeypatch
+    ):
+        """The process-global fetch semaphore caps in-flight ioRequest calls
+        at the budget no matter how wide the per-read pool is (issue #5 item
+        2): workers=32 over many chunks, budget shrunk to 4 -- peak observed
+        concurrency must never exceed 4, and bytes stay identical."""
+        import threading
+        import time
+
+        zb = sys.modules["h5coro_hidefix.zagg_backend"]
+        monkeypatch.setattr(zb, "_FETCH_SEMAPHORE", threading.BoundedSemaphore(4))
+
+        class _TrackingH5:
+            resource = str(h5file)
+            lock = threading.Lock()
+            active = 0
+            peak = 0
+
+            @classmethod
+            def ioRequest(cls, pos, size, caching=True, prefetch=False):  # noqa: N802
+                with cls.lock:
+                    cls.active += 1
+                    cls.peak = max(cls.peak, cls.active)
+                time.sleep(0.005)
+                try:
+                    with open(h5file, "rb") as f:
+                        f.seek(pos)
+                        return f.read(size)
+                finally:
+                    with cls.lock:
+                        cls.active -= 1
+
+        # Post-coalescing (PR #4), a real full read merges to ~1 span, which
+        # would make this test vacuous -- so exercise _fetch_chunks directly
+        # with synthetic ranges spaced > _COALESCE_GAP apart (unmergeable),
+        # mapped back to real file bytes by the driver.
+        from h5coro_hidefix.zagg_backend import _fetch_chunks
+
+        vidx = Index(str(h5file))
+        a, s, _ = vidx.read_plan(DSETS[0], None, None)
+        real0, size0 = int(a[0]), int(s[0])
+        gap = 2 * 1024 * 1024
+        n = 12
+        f_addrs = [real0 + k * gap for k in range(n)]
+        f_sizes = [size0] * n
+
+        class _MappedTrackingH5(_TrackingH5):
+            @classmethod
+            def ioRequest(cls, pos, size, caching=True, prefetch=False):  # noqa: N802
+                return super().ioRequest(real0 + (pos - real0) % gap, size)
+
+        bufs = _fetch_chunks(_MappedTrackingH5, f_addrs, f_sizes, 32)
+        with open(h5file, "rb") as f:
+            f.seek(real0)
+            expect = f.read(size0)
+        assert all(bytes(b) == expect for b in bufs)
+        assert len(bufs) == n
+        # classmethod counters bind to the SUBCLASS via cls -- assert there.
+        assert _MappedTrackingH5.peak <= 4
+        assert _MappedTrackingH5.peak >= 2  # the pool did run fetches concurrently
+
+    def test_fetch_budget_contention_across_read_fns(
+        self, sidecar_cls, idx, h5file, monkeypatch
+    ):
+        """Two read_fns contending for a budget of 2 (two threads, different
+        datasets) both complete byte-identical -- the semaphore is only ever
+        held around the GET itself, so contention cannot deadlock."""
+        import threading
+
+        zb = sys.modules["h5coro_hidefix.zagg_backend"]
+        monkeypatch.setattr(zb, "_FETCH_SEMAPHORE", threading.BoundedSemaphore(2))
+
+        class _FakeH5:
+            resource = str(h5file)
+
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                with open(h5file, "rb") as f:
+                    f.seek(pos)
+                    return f.read(size)
+
+        backend = sidecar_cls(store="unused")
+        cols = _manifest_columns(idx, DSETS)
+        vidx = Index.from_chunks(h5file, datasets_from_manifest(cols))
+        results, errors = {}, []
+
+        def read(path):
+            try:
+                results[path] = backend._read_fn_for(vidx, _FakeH5, workers=8)(path)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=read, args=(p,)) for p in DSETS[:2]]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in threads)  # no deadlock
+        assert not errors
+        for path in DSETS[:2]:
+            assert results[path].tobytes() == idx.read(path).tobytes()
+
+    def test_fetch_budget_env_override(self, sidecar_cls, monkeypatch):
+        """ZAGG_HIDEFIX_FETCH_BUDGET is parsed defensively: positive ints
+        win, anything else falls back to the module default."""
+        zb = sys.modules["h5coro_hidefix.zagg_backend"]
+        monkeypatch.delenv("ZAGG_HIDEFIX_FETCH_BUDGET", raising=False)
+        assert zb._fetch_budget() == zb._FETCH_BUDGET
+        monkeypatch.setenv("ZAGG_HIDEFIX_FETCH_BUDGET", "128")
+        assert zb._fetch_budget() == 128
+        for bad in ("0", "-3", "eight", "2.5", ""):
+            monkeypatch.setenv("ZAGG_HIDEFIX_FETCH_BUDGET", bad)
+            assert zb._fetch_budget() == zb._FETCH_BUDGET
+
     def test_none_buffer_surfaces_as_os_error(self, sidecar_cls, idx, h5file):
         """h5coro drivers swallow exceptions and return None on failed ranged
         reads; that must raise OSError, not fail inside the decoder with a
@@ -388,6 +503,83 @@ class TestProtocolShape:
         backend = sidecar_cls(store=str(tmp_path))
         with pytest.raises(ValueError, match="requires zagg >= 0.15"):
             backend.read_group(object(), "gt1l", {}, 1, grid=None)
+
+    def test_build_delegate_constructed_once_under_concurrent_misses(
+        self, sidecar_cls, monkeypatch, tmp_path
+    ):
+        """on_miss: build under concurrent granule reads (zagg PR #183's
+        threaded worker): two simultaneously-missing granules must share
+        exactly ONE inline write-back delegate. The unguarded lazy init
+        constructed two; the loser's pending chunk maps were never drained
+        by finish_granule, so its manifest went silently sparse."""
+        import threading
+
+        self._stub_read_module(monkeypatch, with_seam=True)
+
+        constructed = []
+        barrier = threading.Barrier(2)
+
+        class _SlowInlineIndex:
+            """Stands in for zagg.index.inline.InlineIndex. The barrier
+            parks the first constructor, so a second thread that also
+            reaches the ``_inline is None`` branch (the unguarded race)
+            provably lands inside ``__init__`` too and both constructions
+            are recorded. Under the lock exactly one thread enters; its
+            barrier times out, breaks, and construction proceeds alone."""
+
+            def __init__(self, write_back=False, store=None):
+                try:
+                    barrier.wait(timeout=1.0)
+                except threading.BrokenBarrierError:
+                    pass
+                constructed.append(self)
+                self.read_calls = []
+                self.finished = []
+
+            def read_group(self, h5obj, group, ds, shard_key, grid, arrow=False):
+                self.read_calls.append(str(h5obj.resource))
+                return "built-sentinel"
+
+            def finish_granule(self, h5obj, granule_url):
+                self.finished.append(granule_url)
+
+        inline_mod = types.ModuleType("zagg.index.inline")
+        inline_mod.InlineIndex = _SlowInlineIndex
+        monkeypatch.setitem(sys.modules, "zagg.index.inline", inline_mod)
+
+        gids = ["ATL03_GRANULE_A_007_01", "ATL03_GRANULE_B_007_01"]
+        urls = [f"s3://bucket/{g}.h5" for g in gids]
+        h5objs = [types.SimpleNamespace(resource=u) for u in urls]
+        backend = sidecar_cls(store=str(tmp_path), on_miss="build")
+        for g in gids:
+            backend._cache[g] = None  # the store covers neither granule
+
+        ds = {"read_plan": {"spatial_index": "segments"}}
+        results, errors = [None, None], []
+
+        def read(i):
+            try:
+                results[i] = backend.read_group(h5objs[i], "gt1l", ds, 1, grid=None)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=read, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert results == ["built-sentinel", "built-sentinel"]
+        # Exactly one delegate, and both threads read through that same one.
+        assert len(constructed) == 1
+        delegate = constructed[0]
+        assert backend._inline is delegate
+        assert sorted(delegate.read_calls) == sorted(urls)
+        # finish_granule forwards to the shared delegate for both granules.
+        for h5, url in zip(h5objs, urls):
+            backend.finish_granule(h5, url)
+        assert sorted(delegate.finished) == sorted(urls)
 
     def test_coalesced_reads_byte_identical(self, sidecar_cls, idx, h5file):
         """Coalesced fetches (any workers width) must equal direct Index

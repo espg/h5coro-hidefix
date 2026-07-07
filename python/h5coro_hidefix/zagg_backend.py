@@ -44,6 +44,19 @@ counts it as a read error); ``build`` delegates to an internal
 ``inline``-with-write-back backend, so served granules also populate the
 store (zagg issue #160's deployment progression).
 
+Concurrency contract (zagg PR #183): granule reads may interleave across
+worker threads — the worker keeps K granules in flight on a bounded pool,
+calling ``read_group`` from pool threads. Per-granule state must be keyed
+by granule id (full resource URL), and ``finish_granule(h5obj,
+granule_url)`` is called exactly once per granule, from the thread that
+read it. Accordingly, ``_cache`` is granule-id-keyed (single-key get/pop
+per granule, safe under the GIL) and the ``on_miss: build`` delegate is
+constructed under a lock. Version note: ``on_miss: build`` with concurrent
+granules requires zagg >= the release carrying zagg PR #183 (its
+``_pending`` re-key to the full resource URL); older zagg's path-keyed
+``_pending`` would interleave chunk maps across granules in the shared
+inline delegate.
+
 Imports: this module imports zagg (it subclasses the protocol) and lazily
 imports pandas for parquet decoding — both are guaranteed in any
 environment that discovers the entry point (zagg's own). The wheel's
@@ -54,6 +67,7 @@ this module.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
@@ -67,6 +81,43 @@ from h5coro_hidefix.manifest import datasets_from_manifest
 logger = logging.getLogger(__name__)
 
 _ON_MISS = ("fallback", "error", "build")
+
+# Process-global in-flight range-GET budget. Each granule's read_fn pools its
+# chunk fetches (_fetch_workers wide) and zagg multiplies that by its
+# dataset-level read_workers pool and, under zagg PR #183, by K granules in
+# flight -- K x read_workers x fetch-width GETs (~384 at K=6 with defaults)
+# against the S3 driver's ~100-connection urllib3 pool, where the overflow
+# queues until the 5s timeout fires and pool exhaustion masquerades as
+# read_errors. The shared semaphore makes the queueing happen HERE instead:
+# orderly, no timeout artifacts, and budget idled by a draining granule flows
+# to granules still reading (tail-granule skew). Default 64 ~= the S3
+# driver's max_pool_connections=100 with headroom; a single number,
+# deliberately not auto-tuned (zagg's fleet A/B at K in {1,2,4,6} produces
+# the evidence for a better default if one exists). Override without a
+# release via env var ZAGG_HIDEFIX_FETCH_BUDGET (positive integer; parsed
+# defensively -- anything else falls back to the default).
+_FETCH_BUDGET = 64
+
+
+def _fetch_budget() -> int:
+    import os
+
+    raw = os.environ.get("ZAGG_HIDEFIX_FETCH_BUDGET")
+    if raw is not None:
+        try:
+            v = int(raw)
+        except ValueError:
+            v = 0
+        if v >= 1:
+            return v
+        logger.warning(
+            f"ignoring ZAGG_HIDEFIX_FETCH_BUDGET={raw!r} (need a positive "
+            f"integer); using default {_FETCH_BUDGET}"
+        )
+    return _FETCH_BUDGET
+
+
+_FETCH_SEMAPHORE = threading.BoundedSemaphore(_fetch_budget())
 
 
 class _ManifestMiss(Exception):
@@ -151,11 +202,19 @@ def _fetch_chunks(h5obj, addrs, sizes, workers: int):
     span buffer (``read_from_buffers`` accepts any bytes-like via the buffer
     protocol); a chunk that got its own span returns the driver buffer as-is.
 
-    Sizing note: total in-flight GETs is bounded by zagg's dataset-level
-    pool times this width (worst case 8x8 = 64 concurrent). h5coro's
-    S3Driver provisions its boto3 client with max_pool_connections=100, so
-    that concurrency is realized, not queued; its adaptive retries + 5s
-    timeout degrade a failed range to None, which surfaces as OSError here.
+    Sizing note: nominal fan-out is zagg's dataset-level pool times this
+    width, and under zagg PR #183 also times the K granules in flight -- so
+    every span GET additionally acquires the process-global
+    ``_FETCH_SEMAPHORE`` (``_FETCH_BUDGET``, env-overridable via
+    ZAGG_HIDEFIX_FETCH_BUDGET), which caps actual in-flight GETs regardless
+    of how the pool widths multiply (coalescing already collapses most
+    chunk fan-out into a handful of spans; the budget is the backstop for
+    many-granule x many-dataset pileups). h5coro's S3Driver provisions its
+    boto3 client with max_pool_connections=100, so budgeted concurrency is
+    realized inside the driver, not queued in urllib3; its adaptive retries
+    + 5s timeout degrade a failed range to None, which surfaces as OSError
+    here. The semaphore is held only around the ioRequest call itself --
+    never while holding another lock -- so contention cannot deadlock.
     Caveat: h5coro's HTTPDriver shares one requests.Session across threads
     (officially unsupported sharing; risk concentrates in EDL redirect
     cookie-jar merges) -- the S3 driver is the deployed path; https callers
@@ -165,7 +224,8 @@ def _fetch_chunks(h5obj, addrs, sizes, workers: int):
 
     def fetch(j: int):
         addr, size = spans[j]
-        buf = h5obj.ioRequest(addr, size, caching=False)
+        with _FETCH_SEMAPHORE:
+            buf = h5obj.ioRequest(addr, size, caching=False)
         if buf is None or len(buf) != size:
             # None AND short returns are transient I/O (review finding, PR #4):
             # a truncated span would otherwise surface as a confusing
@@ -206,11 +266,14 @@ class SidecarIndex(VirtualIndex):
     def __init__(self, store: str, on_miss: str = "fallback"):
         self.store = store
         self.on_miss = on_miss
-        # Per-granule state (the worker reads granules serially and calls
-        # ``finish_granule`` after each): granule id -> reconstructed Index,
-        # or None when the store had no manifest.
+        # Per-granule state, keyed by granule id (see the concurrency
+        # contract in the module docstring — granule reads may interleave
+        # across worker threads): granule id -> reconstructed Index, or None
+        # when the store had no manifest. Single-key get/pop per granule, so
+        # safe under the GIL as-is.
         self._cache: dict[str, Index | None] = {}
         self._inline = None  # lazily-built inline+write_back delegate (on_miss: build)
+        self._inline_lock = threading.Lock()  # guards _inline's one-time construction
 
     # -- config hooks (validate_index_config has already enforced key sets) --
 
@@ -322,9 +385,16 @@ class SidecarIndex(VirtualIndex):
             )
         if self.on_miss == "build":
             if self._inline is None:
-                from zagg.index.inline import InlineIndex
+                # Double-checked: read_group may run concurrently across
+                # granule threads (see the module docstring's concurrency
+                # contract); construct the shared delegate exactly once.
+                # The import stays lazy so module load never pulls
+                # zagg.index.inline.
+                with self._inline_lock:
+                    if self._inline is None:
+                        from zagg.index.inline import InlineIndex
 
-                self._inline = InlineIndex(write_back=True, store=self.store)
+                        self._inline = InlineIndex(write_back=True, store=self.store)
             return self._inline.read_group(
                 h5obj, group, data_source, shard_key, grid, arrow=arrow
             )
@@ -381,7 +451,13 @@ class SidecarIndex(VirtualIndex):
             )
 
     def finish_granule(self, h5obj, granule_url: str) -> None:
-        """Drop the granule's reconstructed index; forward the write-back seam."""
+        """Drop the granule's reconstructed index; forward the write-back seam.
+
+        Called exactly once per granule, from the thread that read it (the
+        module docstring's concurrency contract) — granule reads may
+        interleave, so the forwarded write-back seam relies on the shared
+        inline delegate keying its pending state by granule id.
+        """
         self._cache.pop(_granule_id(h5obj.resource), None)
         self._cache.pop(_granule_id(granule_url), None)
         if self._inline is not None:

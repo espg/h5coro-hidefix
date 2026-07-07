@@ -166,8 +166,13 @@ def _fetch_chunks(h5obj, addrs, sizes, workers: int):
     def fetch(j: int):
         addr, size = spans[j]
         buf = h5obj.ioRequest(addr, size, caching=False)
-        if buf is None:
-            raise OSError(f"ranged read failed at {addr}+{size} (driver returned None)")
+        if buf is None or len(buf) != size:
+            # None AND short returns are transient I/O (review finding, PR #4):
+            # a truncated span would otherwise surface as a confusing
+            # decode-shaped length error from read_from_buffers -- the exact
+            # misdiagnosis the None guard exists to prevent (zagg PR #173).
+            got = "None" if buf is None else f"{len(buf)} bytes"
+            raise OSError(f"ranged read failed at {addr}+{size} (driver returned {got})")
         return buf
 
     m = len(spans)

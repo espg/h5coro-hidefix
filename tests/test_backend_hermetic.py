@@ -446,6 +446,75 @@ class TestProtocolShape:
 
         assert all(s <= _COALESCE_MAX_SPAN for _, s in _CountingH5.calls)
 
+    def test_cross_span_slicing_byte_identical(self, idx, h5file):
+        """5 unsorted chunk ranges split by a >1 MiB gap into 2 spans: the
+        per-chunk slices must be byte-identical at workers 1 and 4 (review
+        finding, PR #4: no prior test crossed a span split with real bytes)."""
+        from h5coro_hidefix.zagg_backend import _fetch_chunks
+
+        name = "/gt1l/heights/h_ph"
+        vidx = Index(str(h5file))
+        a, s, _ = vidx.read_plan(name, None, None)
+        # Fabricate a far-away second span by re-reading the same chunks with
+        # a synthetic gap: fetch real chunk 0..2 plus chunk 0..1 again shifted
+        # through a fake driver that maps the shifted addresses back.
+        base = [(int(x), int(y)) for x, y in zip(a, s)]
+        gap = 2 * 1024 * 1024
+        fake_ranges = base[:3] + [(addr + gap, size) for addr, size in base[:2]]
+        import random
+
+        rng = random.Random(7)
+        order = list(range(len(fake_ranges)))
+        rng.shuffle(order)
+        shuffled = [fake_ranges[i] for i in order]
+
+        class _MappedH5:
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                real = pos - gap if pos >= base[0][0] + gap else pos
+                with open(h5file, "rb") as f:
+                    f.seek(real)
+                    return f.read(size)
+
+        f_addrs = [r[0] for r in shuffled]
+        f_sizes = [r[1] for r in shuffled]
+        serial = _fetch_chunks(_MappedH5, f_addrs, f_sizes, 1)
+        pooled = _fetch_chunks(_MappedH5, f_addrs, f_sizes, 4)
+        assert [bytes(x) for x in pooled] == [bytes(x) for x in serial]
+        with open(h5file, "rb") as f:
+            for (addr, size), got in zip(shuffled, serial):
+                f.seek(addr - gap if addr >= base[0][0] + gap else addr)
+                assert bytes(got) == f.read(size)
+
+    def test_short_span_return_surfaces_as_os_error(self, idx, h5file):
+        """A driver returning FEWER bytes than requested is transient I/O and
+        must raise OSError at the fetch, not a decode-shaped length error
+        from read_from_buffers (review finding, PR #4)."""
+        class _TruncatingH5:
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                with open(h5file, "rb") as f:
+                    f.seek(pos)
+                    return f.read(max(0, size - 13))
+
+        from h5coro_hidefix.zagg_backend import _fetch_chunks
+
+        vidx = Index(str(h5file))
+        a, s, _ = vidx.read_plan("/gt1l/heights/h_ph", None, None)
+        with pytest.raises(OSError, match="ranged read failed"):
+            _fetch_chunks(_TruncatingH5, [int(x) for x in a], [int(y) for y in s], 4)
+
+    def test_merge_exact_max_span_boundary(self):
+        """merged_end - start == MAX_SPAN merges; one byte more splits
+        (review finding, PR #4: the caps test only exercised the gap cap)."""
+        from h5coro_hidefix.zagg_backend import _COALESCE_MAX_SPAN, _merge_ranges
+
+        half = _COALESCE_MAX_SPAN // 2
+        spans, _ = _merge_ranges([0, half], [half, half])
+        assert len(spans) == 1
+        spans, _ = _merge_ranges([0, half], [half, half + 1])
+        assert len(spans) == 2
+
     def test_fetch_workers_validation(self):
         from h5coro_hidefix.zagg_backend import _fetch_workers
 

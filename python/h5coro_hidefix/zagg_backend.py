@@ -146,49 +146,114 @@ def _fetch_workers(data_source) -> int:
     return w
 
 
-def _fetch_chunks(h5obj, addrs, sizes, workers: int):
-    """Fetch covering-chunk byte ranges, pooled and order-preserving.
+# Range-coalescing tunables (zagg issue #170 final table: the compiled path
+# paid one GET round trip per covering chunk while h5coro amortizes them into
+# ~4 MiB cache lines). Two chunk ranges merge into one ranged GET when the
+# file gap between them is <= _COALESCE_GAP and the merged span stays
+# <= _COALESCE_MAX_SPAN. Gap bytes are fetched and discarded: wasted
+# bandwidth is bounded by GAP per merge, and at S3 latency round trips beat
+# bandwidth -- the same trade h5coro's cache lines make. Module constants for
+# now; promote to config tunables if fleet evidence asks for it.
+_COALESCE_GAP = 1 << 20  # 1 MiB
+_COALESCE_MAX_SPAN = 16 << 20  # 16 MiB
 
-    Each entry is one blocking ranged read through the worker's h5coro
-    driver (``ioRequest(caching=False)`` -- no second credential path).
+
+def _merge_ranges(addrs, sizes):
+    """Plan coalesced spans for the given byte ranges.
+
+    Returns ``(spans, assign)``: ``spans`` is a list of ``(addr, size)``
+    merged fetch spans in ascending file order, ``assign[i]`` the span index
+    serving input range ``i``. Inputs may be unsorted (chunk-index order is
+    not file order) and may overlap or duplicate -- a range falling inside an
+    already-merged span is served from it.
+    """
+    order = sorted(range(len(addrs)), key=lambda i: int(addrs[i]))
+    spans: list[list[int]] = []  # [start, end) pairs
+    assign = [0] * len(addrs)
+    for i in order:
+        start, end = int(addrs[i]), int(addrs[i]) + int(sizes[i])
+        if spans:
+            s0, e0 = spans[-1]
+            merged_end = max(e0, end)
+            if start - e0 <= _COALESCE_GAP and merged_end - s0 <= _COALESCE_MAX_SPAN:
+                spans[-1][1] = merged_end
+                assign[i] = len(spans) - 1
+                continue
+        spans.append([start, end])
+        assign[i] = len(spans) - 1
+    return [(s, e - s) for s, e in spans], assign
+
+
+def _fetch_chunks(h5obj, addrs, sizes, workers: int):
+    """Fetch covering-chunk byte ranges, coalesced, pooled, order-preserving.
+
+    Near-adjacent ranges are merged into spans (``_merge_ranges``) so one
+    planned read costs a handful of large ranged GETs instead of one per
+    chunk (zagg issue #170: round trips, not decode, dominate the read wall).
+    Each span is one blocking ranged read through the worker's h5coro driver
+    (``ioRequest(caching=False)`` -- no second credential path).
     ``ThreadPoolExecutor.map`` preserves input order and re-raises the first
     failure. A driver that swallows an error and returns ``None`` surfaces
     as ``OSError`` here -- transient I/O, never misdiagnosed as a decode
     failure inside ``read_from_buffers`` (zagg PR #173 review lesson).
 
+    The return is one buffer per *input* range, in input order: a chunk
+    served by a multi-chunk span is a zero-copy ``memoryview`` slice of the
+    span buffer (``read_from_buffers`` accepts any bytes-like via the buffer
+    protocol); a chunk that got its own span returns the driver buffer as-is.
+
     Sizing note: nominal fan-out is zagg's dataset-level pool times this
     width, and under zagg PR #183 also times the K granules in flight -- so
-    every GET additionally acquires the process-global ``_FETCH_SEMAPHORE``
-    (``_FETCH_BUDGET``, env-overridable via ZAGG_HIDEFIX_FETCH_BUDGET),
-    which caps actual in-flight GETs regardless of how the three pool
-    widths multiply. h5coro's S3Driver provisions its boto3 client with
-    max_pool_connections=100, so budgeted concurrency is realized inside
-    the driver, not queued in urllib3; its adaptive retries + 5s timeout
-    degrade a failed range to None, which surfaces as OSError here. The
-    semaphore is held only around the ioRequest call itself -- never while
-    holding another lock -- so contention cannot deadlock.
+    every span GET additionally acquires the process-global
+    ``_FETCH_SEMAPHORE`` (``_FETCH_BUDGET``, env-overridable via
+    ZAGG_HIDEFIX_FETCH_BUDGET), which caps actual in-flight GETs regardless
+    of how the pool widths multiply (coalescing already collapses most
+    chunk fan-out into a handful of spans; the budget is the backstop for
+    many-granule x many-dataset pileups). h5coro's S3Driver provisions its
+    boto3 client with max_pool_connections=100, so budgeted concurrency is
+    realized inside the driver, not queued in urllib3; its adaptive retries
+    + 5s timeout degrade a failed range to None, which surfaces as OSError
+    here. The semaphore is held only around the ioRequest call itself --
+    never while holding another lock -- so contention cannot deadlock.
     Caveat: h5coro's HTTPDriver shares one requests.Session across threads
     (officially unsupported sharing; risk concentrates in EDL redirect
     cookie-jar merges) -- the S3 driver is the deployed path; https callers
     wanting strict isolation can set read_workers: 1.
     """
-    def fetch(i: int):
+    spans, assign = _merge_ranges(addrs, sizes)
+
+    def fetch(j: int):
+        addr, size = spans[j]
         with _FETCH_SEMAPHORE:
-            buf = h5obj.ioRequest(int(addrs[i]), int(sizes[i]), caching=False)
-        if buf is None:
-            raise OSError(
-                f"ranged read failed at {int(addrs[i])}+{int(sizes[i])} "
-                "(driver returned None)"
-            )
+            buf = h5obj.ioRequest(addr, size, caching=False)
+        if buf is None or len(buf) != size:
+            # None AND short returns are transient I/O (review finding, PR #4):
+            # a truncated span would otherwise surface as a confusing
+            # decode-shaped length error from read_from_buffers -- the exact
+            # misdiagnosis the None guard exists to prevent (zagg PR #173).
+            got = "None" if buf is None else f"{len(buf)} bytes"
+            raise OSError(f"ranged read failed at {addr}+{size} (driver returned {got})")
         return buf
 
-    n = len(addrs)
-    if workers <= 1 or n <= 1:
-        return [fetch(i) for i in range(n)]
-    from concurrent.futures import ThreadPoolExecutor
+    m = len(spans)
+    if workers <= 1 or m <= 1:
+        span_bufs = [fetch(j) for j in range(m)]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
 
-    with ThreadPoolExecutor(max_workers=min(workers, n)) as pool:
-        return list(pool.map(fetch, range(n)))
+        with ThreadPoolExecutor(max_workers=min(workers, m)) as pool:
+            span_bufs = list(pool.map(fetch, range(m)))
+
+    out = []
+    for i in range(len(addrs)):
+        j = assign[i]
+        addr, size = spans[j]
+        if int(addrs[i]) == addr and int(sizes[i]) == size:
+            out.append(span_bufs[j])  # span == chunk: hand the buffer through
+        else:
+            off = int(addrs[i]) - addr
+            out.append(memoryview(span_bufs[j])[off : off + int(sizes[i])])
+    return out
 
 
 class SidecarIndex(VirtualIndex):

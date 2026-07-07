@@ -235,6 +235,69 @@ class TestProtocolShape:
         one = read_fn("/gt1l/heights/h_ph", [(n - 1, n)])
         assert one.shape == (1,)
 
+    def test_pooled_fetches_byte_identical_and_ordered(self, sidecar_cls, idx, h5file):
+        """workers=8 must equal workers=1 byte-for-byte even when fetch
+        completion order is scrambled -- read_from_buffers depends on the
+        buffers arriving in read_plan order (zagg issue #170)."""
+        import threading
+        import time
+
+        class _JitteredH5:
+            resource = str(h5file)
+            calls: list = []
+            lock = threading.Lock()
+
+            @classmethod
+            def ioRequest(cls, pos, size, caching=True, prefetch=False):  # noqa: N802
+                # Later offsets return FIRST: completion order is the exact
+                # reverse of submission order, so any ordering bug shows.
+                with cls.lock:
+                    cls.calls.append(pos)
+                    rank = len(cls.calls)
+                time.sleep(max(0.0, 0.03 - 0.005 * rank))
+                with open(h5file, "rb") as f:
+                    f.seek(pos)
+                    return f.read(size)
+
+        backend = sidecar_cls(store="unused")
+        cols = _manifest_columns(idx, DSETS)
+        vidx = Index.from_chunks(h5file, datasets_from_manifest(cols))
+        serial = backend._read_fn_for(vidx, _JitteredH5, workers=1)
+        pooled = backend._read_fn_for(vidx, _JitteredH5, workers=8)
+        for path in DSETS[:2]:
+            assert pooled(path).tobytes() == serial(path).tobytes()
+            hs = [(5, 800), (2500, 2501)]
+            assert pooled(path, hs).tobytes() == serial(path, hs).tobytes()
+        assert len(_JitteredH5.calls) > 0
+
+    def test_none_buffer_surfaces_as_os_error(self, sidecar_cls, idx, h5file):
+        """h5coro drivers swallow exceptions and return None on failed ranged
+        reads; that must raise OSError, not fail inside the decoder with a
+        buffer-type error (zagg PR #173 review lesson)."""
+        class _FlakyH5:
+            resource = str(h5file)
+
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                return None
+
+        backend = sidecar_cls(store="unused")
+        cols = _manifest_columns(idx, DSETS)
+        vidx = Index.from_chunks(h5file, datasets_from_manifest(cols))
+        read_fn = backend._read_fn_for(vidx, _FlakyH5, workers=4)
+        with pytest.raises(OSError, match="ranged read failed"):
+            read_fn(DSETS[0], [(0, 10)])
+
+    def test_fetch_workers_validation(self):
+        from h5coro_hidefix.zagg_backend import _fetch_workers
+
+        assert _fetch_workers({}) == 8
+        assert _fetch_workers(None) == 8
+        assert _fetch_workers({"read_workers": 3}) == 3
+        for bad in (0, -1, True, "eight", 2.5):
+            with pytest.raises(ValueError, match="read_workers"):
+                _fetch_workers({"read_workers": bad})
+
     def test_read_fn_missing_dataset_raises_miss(self, sidecar_cls, idx, h5file):
         from h5coro_hidefix.zagg_backend import _ManifestMiss
 

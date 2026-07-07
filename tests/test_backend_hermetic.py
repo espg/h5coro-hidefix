@@ -284,6 +284,103 @@ class TestProtocolShape:
             assert pooled(path, hs).tobytes() == serial(path, hs).tobytes()
         assert len(_JitteredH5.calls) > 0
 
+    def test_fetch_budget_caps_concurrent_gets(
+        self, sidecar_cls, idx, h5file, monkeypatch
+    ):
+        """The process-global fetch semaphore caps in-flight ioRequest calls
+        at the budget no matter how wide the per-read pool is (issue #5 item
+        2): workers=32 over many chunks, budget shrunk to 4 -- peak observed
+        concurrency must never exceed 4, and bytes stay identical."""
+        import threading
+        import time
+
+        zb = sys.modules["h5coro_hidefix.zagg_backend"]
+        monkeypatch.setattr(zb, "_FETCH_SEMAPHORE", threading.BoundedSemaphore(4))
+
+        class _TrackingH5:
+            resource = str(h5file)
+            lock = threading.Lock()
+            active = 0
+            peak = 0
+
+            @classmethod
+            def ioRequest(cls, pos, size, caching=True, prefetch=False):  # noqa: N802
+                with cls.lock:
+                    cls.active += 1
+                    cls.peak = max(cls.peak, cls.active)
+                time.sleep(0.005)
+                try:
+                    with open(h5file, "rb") as f:
+                        f.seek(pos)
+                        return f.read(size)
+                finally:
+                    with cls.lock:
+                        cls.active -= 1
+
+        backend = sidecar_cls(store="unused")
+        cols = _manifest_columns(idx, DSETS)
+        vidx = Index.from_chunks(h5file, datasets_from_manifest(cols))
+        path = DSETS[0]
+        addrs, _, _ = vidx.read_plan(path, None, None)
+        assert len(addrs) > 4  # enough chunks that an uncapped pool would exceed 4
+        read_fn = backend._read_fn_for(vidx, _TrackingH5, workers=32)
+        assert read_fn(path).tobytes() == idx.read(path).tobytes()
+        assert _TrackingH5.peak <= 4
+        assert _TrackingH5.peak >= 2  # the pool did run fetches concurrently
+
+    def test_fetch_budget_contention_across_read_fns(
+        self, sidecar_cls, idx, h5file, monkeypatch
+    ):
+        """Two read_fns contending for a budget of 2 (two threads, different
+        datasets) both complete byte-identical -- the semaphore is only ever
+        held around the GET itself, so contention cannot deadlock."""
+        import threading
+
+        zb = sys.modules["h5coro_hidefix.zagg_backend"]
+        monkeypatch.setattr(zb, "_FETCH_SEMAPHORE", threading.BoundedSemaphore(2))
+
+        class _FakeH5:
+            resource = str(h5file)
+
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                with open(h5file, "rb") as f:
+                    f.seek(pos)
+                    return f.read(size)
+
+        backend = sidecar_cls(store="unused")
+        cols = _manifest_columns(idx, DSETS)
+        vidx = Index.from_chunks(h5file, datasets_from_manifest(cols))
+        results, errors = {}, []
+
+        def read(path):
+            try:
+                results[path] = backend._read_fn_for(vidx, _FakeH5, workers=8)(path)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=read, args=(p,)) for p in DSETS[:2]]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in threads)  # no deadlock
+        assert not errors
+        for path in DSETS[:2]:
+            assert results[path].tobytes() == idx.read(path).tobytes()
+
+    def test_fetch_budget_env_override(self, sidecar_cls, monkeypatch):
+        """ZAGG_HIDEFIX_FETCH_BUDGET is parsed defensively: positive ints
+        win, anything else falls back to the module default."""
+        zb = sys.modules["h5coro_hidefix.zagg_backend"]
+        monkeypatch.delenv("ZAGG_HIDEFIX_FETCH_BUDGET", raising=False)
+        assert zb._fetch_budget() == zb._FETCH_BUDGET
+        monkeypatch.setenv("ZAGG_HIDEFIX_FETCH_BUDGET", "128")
+        assert zb._fetch_budget() == 128
+        for bad in ("0", "-3", "eight", "2.5", ""):
+            monkeypatch.setenv("ZAGG_HIDEFIX_FETCH_BUDGET", bad)
+            assert zb._fetch_budget() == zb._FETCH_BUDGET
+
     def test_none_buffer_surfaces_as_os_error(self, sidecar_cls, idx, h5file):
         """h5coro drivers swallow exceptions and return None on failed ranged
         reads; that must raise OSError, not fail inside the decoder with a

@@ -82,6 +82,43 @@ logger = logging.getLogger(__name__)
 
 _ON_MISS = ("fallback", "error", "build")
 
+# Process-global in-flight range-GET budget. Each granule's read_fn pools its
+# chunk fetches (_fetch_workers wide) and zagg multiplies that by its
+# dataset-level read_workers pool and, under zagg PR #183, by K granules in
+# flight -- K x read_workers x fetch-width GETs (~384 at K=6 with defaults)
+# against the S3 driver's ~100-connection urllib3 pool, where the overflow
+# queues until the 5s timeout fires and pool exhaustion masquerades as
+# read_errors. The shared semaphore makes the queueing happen HERE instead:
+# orderly, no timeout artifacts, and budget idled by a draining granule flows
+# to granules still reading (tail-granule skew). Default 64 ~= the S3
+# driver's max_pool_connections=100 with headroom; a single number,
+# deliberately not auto-tuned (zagg's fleet A/B at K in {1,2,4,6} produces
+# the evidence for a better default if one exists). Override without a
+# release via env var ZAGG_HIDEFIX_FETCH_BUDGET (positive integer; parsed
+# defensively -- anything else falls back to the default).
+_FETCH_BUDGET = 64
+
+
+def _fetch_budget() -> int:
+    import os
+
+    raw = os.environ.get("ZAGG_HIDEFIX_FETCH_BUDGET")
+    if raw is not None:
+        try:
+            v = int(raw)
+        except ValueError:
+            v = 0
+        if v >= 1:
+            return v
+        logger.warning(
+            f"ignoring ZAGG_HIDEFIX_FETCH_BUDGET={raw!r} (need a positive "
+            f"integer); using default {_FETCH_BUDGET}"
+        )
+    return _FETCH_BUDGET
+
+
+_FETCH_SEMAPHORE = threading.BoundedSemaphore(_fetch_budget())
+
 
 class _ManifestMiss(Exception):
     """Store has no manifest for this granule, or no rows for a dataset."""
@@ -119,18 +156,25 @@ def _fetch_chunks(h5obj, addrs, sizes, workers: int):
     as ``OSError`` here -- transient I/O, never misdiagnosed as a decode
     failure inside ``read_from_buffers`` (zagg PR #173 review lesson).
 
-    Sizing note: total in-flight GETs is bounded by zagg's dataset-level
-    pool times this width (worst case 8x8 = 64 concurrent). h5coro's
-    S3Driver provisions its boto3 client with max_pool_connections=100, so
-    that concurrency is realized, not queued; its adaptive retries + 5s
-    timeout degrade a failed range to None, which surfaces as OSError here.
+    Sizing note: nominal fan-out is zagg's dataset-level pool times this
+    width, and under zagg PR #183 also times the K granules in flight -- so
+    every GET additionally acquires the process-global ``_FETCH_SEMAPHORE``
+    (``_FETCH_BUDGET``, env-overridable via ZAGG_HIDEFIX_FETCH_BUDGET),
+    which caps actual in-flight GETs regardless of how the three pool
+    widths multiply. h5coro's S3Driver provisions its boto3 client with
+    max_pool_connections=100, so budgeted concurrency is realized inside
+    the driver, not queued in urllib3; its adaptive retries + 5s timeout
+    degrade a failed range to None, which surfaces as OSError here. The
+    semaphore is held only around the ioRequest call itself -- never while
+    holding another lock -- so contention cannot deadlock.
     Caveat: h5coro's HTTPDriver shares one requests.Session across threads
     (officially unsupported sharing; risk concentrates in EDL redirect
     cookie-jar merges) -- the S3 driver is the deployed path; https callers
     wanting strict isolation can set read_workers: 1.
     """
     def fetch(i: int):
-        buf = h5obj.ioRequest(int(addrs[i]), int(sizes[i]), caching=False)
+        with _FETCH_SEMAPHORE:
+            buf = h5obj.ioRequest(int(addrs[i]), int(sizes[i]), caching=False)
         if buf is None:
             raise OSError(
                 f"ranged read failed at {int(addrs[i])}+{int(sizes[i])} "

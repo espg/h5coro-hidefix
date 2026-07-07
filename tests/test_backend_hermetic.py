@@ -190,15 +190,27 @@ class TestProtocolShape:
             sidecar_cls.validate_index_config(
                 {"backend": "sidecar", "store": "/x", "on_miss": "explode"}, ds_ok
             )
-        with pytest.raises(ValueError, match="spatial_index"):
-            sidecar_cls.validate_index_config(
-                {"backend": "sidecar", "store": "/x"}, {"read_plan": {}}
-            )
+        # Flat (read-plan-less) sources are accepted -- both read routes are
+        # served since the zagg 0.15 full-read seam (mirrors inline).
+        sidecar_cls.validate_index_config({"backend": "sidecar", "store": "/x"}, {})
+        sidecar_cls.validate_index_config(
+            {"backend": "sidecar", "store": "/x"}, {"read_plan": {}}
+        )
         with pytest.raises(ValueError, match="mutually exclusive"):
             sidecar_cls.validate_index_config(
                 {"backend": "sidecar", "store": "/x"},
                 {"read_plan": {"spatial_index": "s", "chunk_boundaries": "p"}},
             )
+        # read_workers is gated at backend resolution (submission time), not
+        # left to blow up inside a per-group read.
+        for bad in (0, -1, True, "eight", 2.5):
+            with pytest.raises(ValueError, match="read_workers"):
+                sidecar_cls.validate_index_config(
+                    {"backend": "sidecar", "store": "/x"}, {"read_workers": bad}
+                )
+        sidecar_cls.validate_index_config(
+            {"backend": "sidecar", "store": "/x"}, {"read_workers": 4}
+        )
 
     def test_from_index_config(self, sidecar_cls):
         b = sidecar_cls.from_index_config({"backend": "sidecar", "store": "/s"})
@@ -266,7 +278,9 @@ class TestProtocolShape:
         pooled = backend._read_fn_for(vidx, _JitteredH5, workers=8)
         for path in DSETS[:2]:
             assert pooled(path).tobytes() == serial(path).tobytes()
-            hs = [(5, 800), (2500, 2501)]
+            # (500, 3500) spans multiple chunks so the hyperslab arm also
+            # exercises the pool, not just the single-chunk serial branch.
+            hs = [(5, 800), (500, 3500), (2500, 2501)]
             assert pooled(path, hs).tobytes() == serial(path, hs).tobytes()
         assert len(_JitteredH5.calls) > 0
 
@@ -285,8 +299,95 @@ class TestProtocolShape:
         cols = _manifest_columns(idx, DSETS)
         vidx = Index.from_chunks(h5file, datasets_from_manifest(cols))
         read_fn = backend._read_fn_for(vidx, _FlakyH5, workers=4)
+        # Full read: many covering chunks, so the POOLED branch's mid-stream
+        # re-raise (pool.map) is what gets exercised, not the n <= 1 serial
+        # short-circuit (review finding on this PR).
+        with pytest.raises(OSError, match="ranged read failed"):
+            read_fn(DSETS[0])
+        # Single-chunk span: the serial branch raises identically.
         with pytest.raises(OSError, match="ranged read failed"):
             read_fn(DSETS[0], [(0, 10)])
+
+    def _stub_read_module(self, monkeypatch, with_seam=True):
+        """Install a fake ``zagg.processing.read`` capturing the route taken.
+
+        ``with_seam=True`` mirrors zagg >= 0.15 (``_read_group_full`` accepts
+        ``read_fn``); ``False`` mirrors an older zagg (no seam parameter).
+        """
+        import sys
+        import types
+
+        calls = {}
+        read_mod = types.ModuleType("zagg.processing.read")
+
+        def _planned_read_group(h5obj, group, ds, shard_key, grid, arrow=False, read_fn=None):
+            calls["route"] = "planned"
+            calls["read_fn"] = read_fn
+            return "planned-sentinel"
+
+        def _validate_planned_config(ds):
+            pass
+
+        if with_seam:
+
+            def _read_group_full(h5obj, group, ds, shard_key, grid, arrow=False, read_fn=None):
+                calls["route"] = "full"
+                calls["read_fn"] = read_fn
+                return "full-sentinel"
+        else:
+
+            def _read_group_full(h5obj, group, ds, shard_key, grid, arrow=False):
+                calls["route"] = "full-legacy"
+                return "full-legacy-sentinel"
+
+        read_mod._planned_read_group = _planned_read_group
+        read_mod._validate_planned_config = _validate_planned_config
+        read_mod._read_group_full = _read_group_full
+        proc_mod = types.ModuleType("zagg.processing")
+        proc_mod.read = read_mod
+        monkeypatch.setitem(sys.modules, "zagg.processing", proc_mod)
+        monkeypatch.setitem(sys.modules, "zagg.processing.read", read_mod)
+        return calls
+
+    def test_flat_source_routes_to_full_read_seam(
+        self, sidecar_cls, idx, h5file, monkeypatch, tmp_path
+    ):
+        """A read-plan-less (flat) data source takes the compiled full-read
+        route (zagg >= 0.15 seam), with a working read_fn attached."""
+        from pathlib import Path
+
+        calls = self._stub_read_module(monkeypatch, with_seam=True)
+
+        class _FakeH5:
+            resource = str(h5file)
+
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                with open(h5file, "rb") as f:
+                    f.seek(pos)
+                    return f.read(size)
+
+        backend = sidecar_cls(store=str(tmp_path))
+        # Pre-seed the per-granule cache: manifest fetch (obstore) is covered
+        # by the parquet round-trip tests; this test pins the ROUTING.
+        cols = _manifest_columns(idx, DSETS)
+        vidx = Index.from_chunks(str(h5file), datasets_from_manifest(cols))
+        backend._cache[Path(str(h5file)).stem] = vidx
+        out = backend.read_group(_FakeH5, "gt1l", {}, 1, grid=None)
+        assert out == "full-sentinel"
+        assert calls["route"] == "full"
+        got = calls["read_fn"]("/gt1l/heights/h_ph", [(5, 800)])
+        assert got.tobytes() == idx.read("/gt1l/heights/h_ph", 5, 800).tobytes()
+
+    def test_flat_source_on_old_zagg_is_actionable(
+        self, sidecar_cls, idx, h5file, monkeypatch, tmp_path
+    ):
+        """Against a pre-seam zagg (no read_fn on _read_group_full), a flat
+        source fails loudly with the upgrade path, never silently degrades."""
+        self._stub_read_module(monkeypatch, with_seam=False)
+        backend = sidecar_cls(store=str(tmp_path))
+        with pytest.raises(ValueError, match="requires zagg >= 0.15"):
+            backend.read_group(object(), "gt1l", {}, 1, grid=None)
 
     def test_fetch_workers_validation(self):
         from h5coro_hidefix.zagg_backend import _fetch_workers

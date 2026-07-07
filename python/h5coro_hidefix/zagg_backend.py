@@ -57,6 +57,8 @@ import logging
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
+from inspect import signature as _sig
+
 from zagg.index import VirtualIndex
 
 from h5coro_hidefix import Index
@@ -81,9 +83,11 @@ def _fetch_workers(data_source) -> int:
 
     One knob governs both fan-out levels -- zagg pools across datasets with
     the same key, this backend pools the per-chunk fetches inside each read.
-    zagg validates the value at submission; re-validated here (same message)
-    so a standalone/older-zagg caller still fails loudly instead of silently
-    running serial. Default 8; ``1`` is serial (the pre-pool behavior).
+    zagg >= 0.15 validates the value at submission, and
+    ``validate_index_config`` re-checks it at backend resolution; the guard
+    here is the last line of defense (note it raises inside a group read,
+    where zagg's worker counts it as a read error rather than aborting the
+    shard). Default 8; ``1`` is serial (the pre-pool behavior).
     """
     w = (data_source or {}).get("read_workers", 8)
     if isinstance(w, bool) or not isinstance(w, int) or w < 1:
@@ -102,9 +106,14 @@ def _fetch_chunks(h5obj, addrs, sizes, workers: int):
     failure inside ``read_from_buffers`` (zagg PR #173 review lesson).
 
     Sizing note: total in-flight GETs is bounded by zagg's dataset-level
-    pool times this width; boto3's default connection pool (10) soft-caps
-    the realized concurrency per client, which is safe -- excess fetches
-    queue on the pool rather than erroring.
+    pool times this width (worst case 8x8 = 64 concurrent). h5coro's
+    S3Driver provisions its boto3 client with max_pool_connections=100, so
+    that concurrency is realized, not queued; its adaptive retries + 5s
+    timeout degrade a failed range to None, which surfaces as OSError here.
+    Caveat: h5coro's HTTPDriver shares one requests.Session across threads
+    (officially unsupported sharing; risk concentrates in EDL redirect
+    cookie-jar merges) -- the S3 driver is the deployed path; https callers
+    wanting strict isolation can set read_workers: 1.
     """
     def fetch(i: int):
         buf = h5obj.ioRequest(int(addrs[i]), int(sizes[i]), caching=False)
@@ -154,16 +163,24 @@ class SidecarIndex(VirtualIndex):
         if on_miss not in _ON_MISS:
             raise ValueError(f"index.on_miss must be one of {list(_ON_MISS)} (got {on_miss!r})")
         if data_source is not None:
+            # Both read routes are served (mirrors zagg 0.15's inline): sources
+            # with read_plan.spatial_index take the planned route, read-plan-less
+            # (flat) sources the compiled full-read route -- no spatial_index
+            # requirement anymore. The a-priori arm stays mutually exclusive.
             rp = data_source.get("read_plan")
-            if not (isinstance(rp, dict) and rp.get("spatial_index")):
-                raise ValueError(
-                    "index backend 'sidecar' requires data_source.read_plan.spatial_index "
-                    "(chunk addressing plugs into the planned read path)"
-                )
-            if "chunk_boundaries" in rp:
+            if isinstance(rp, dict) and "chunk_boundaries" in rp:
                 raise ValueError(
                     "index backend 'sidecar' and read_plan.chunk_boundaries (the "
                     "a-priori arm) are mutually exclusive; drop one of them"
+                )
+            # Same gate zagg >=0.15 applies at submission -- validated here too
+            # so hand-rolled worker payloads and older-zagg callers are rejected
+            # at backend resolution rather than inside a per-group read (where
+            # zagg's worker would swallow it into read_errors).
+            w = data_source.get("read_workers")
+            if w is not None and (isinstance(w, bool) or not isinstance(w, int) or w < 1):
+                raise ValueError(
+                    f"data_source.read_workers must be an integer >= 1 (got {w!r})"
                 )
 
     @classmethod
@@ -261,10 +278,26 @@ class SidecarIndex(VirtualIndex):
     def read_group(self, h5obj, group, data_source, shard_key, grid, arrow=False, granule_url=None):
         from zagg.processing.read import _planned_read_group, _validate_planned_config
 
+        # Two routes, one addressing seam (mirrors zagg 0.15's inline): planned
+        # (chunk-aligned hyperslices) with a spatial index, compiled full-read
+        # without one. The full-read seam (read_fn on _read_group_full) exists
+        # from zagg 0.15.0; older zagg keeps the planned-only contract.
         rp = data_source.get("read_plan")
-        if not (isinstance(rp, dict) and rp.get("spatial_index")):
-            raise ValueError("index backend 'sidecar' requires data_source.read_plan.spatial_index")
-        _validate_planned_config(data_source)
+        planned = isinstance(rp, dict) and bool(rp.get("spatial_index"))
+        if planned:
+            _validate_planned_config(data_source)
+            route = _planned_read_group
+        else:
+            try:
+                from zagg.processing.read import _read_group_full as route
+            except ImportError:
+                route = None
+            if route is None or "read_fn" not in str(_sig(route)):
+                raise ValueError(
+                    "index backend 'sidecar' on a read-plan-less (flat) data source "
+                    "requires zagg >= 0.15 (the compiled full-read seam); either "
+                    "upgrade zagg or add data_source.read_plan.spatial_index"
+                )
 
         vidx = self._index_for(h5obj)
         if vidx is None:
@@ -273,7 +306,7 @@ class SidecarIndex(VirtualIndex):
                 f"granule {_granule_id(h5obj.resource)!r}",
             )
         try:
-            return _planned_read_group(
+            return route(
                 h5obj, group, data_source, shard_key, grid,
                 arrow=arrow,
                 read_fn=self._read_fn_for(vidx, h5obj, workers=_fetch_workers(data_source)),

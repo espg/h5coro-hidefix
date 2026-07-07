@@ -389,6 +389,83 @@ class TestProtocolShape:
         with pytest.raises(ValueError, match="requires zagg >= 0.15"):
             backend.read_group(object(), "gt1l", {}, 1, grid=None)
 
+    def test_build_delegate_constructed_once_under_concurrent_misses(
+        self, sidecar_cls, monkeypatch, tmp_path
+    ):
+        """on_miss: build under concurrent granule reads (zagg PR #183's
+        threaded worker): two simultaneously-missing granules must share
+        exactly ONE inline write-back delegate. The unguarded lazy init
+        constructed two; the loser's pending chunk maps were never drained
+        by finish_granule, so its manifest went silently sparse."""
+        import threading
+
+        self._stub_read_module(monkeypatch, with_seam=True)
+
+        constructed = []
+        barrier = threading.Barrier(2)
+
+        class _SlowInlineIndex:
+            """Stands in for zagg.index.inline.InlineIndex. The barrier
+            parks the first constructor, so a second thread that also
+            reaches the ``_inline is None`` branch (the unguarded race)
+            provably lands inside ``__init__`` too and both constructions
+            are recorded. Under the lock exactly one thread enters; its
+            barrier times out, breaks, and construction proceeds alone."""
+
+            def __init__(self, write_back=False, store=None):
+                try:
+                    barrier.wait(timeout=1.0)
+                except threading.BrokenBarrierError:
+                    pass
+                constructed.append(self)
+                self.read_calls = []
+                self.finished = []
+
+            def read_group(self, h5obj, group, ds, shard_key, grid, arrow=False):
+                self.read_calls.append(str(h5obj.resource))
+                return "built-sentinel"
+
+            def finish_granule(self, h5obj, granule_url):
+                self.finished.append(granule_url)
+
+        inline_mod = types.ModuleType("zagg.index.inline")
+        inline_mod.InlineIndex = _SlowInlineIndex
+        monkeypatch.setitem(sys.modules, "zagg.index.inline", inline_mod)
+
+        gids = ["ATL03_GRANULE_A_007_01", "ATL03_GRANULE_B_007_01"]
+        urls = [f"s3://bucket/{g}.h5" for g in gids]
+        h5objs = [types.SimpleNamespace(resource=u) for u in urls]
+        backend = sidecar_cls(store=str(tmp_path), on_miss="build")
+        for g in gids:
+            backend._cache[g] = None  # the store covers neither granule
+
+        ds = {"read_plan": {"spatial_index": "segments"}}
+        results, errors = [None, None], []
+
+        def read(i):
+            try:
+                results[i] = backend.read_group(h5objs[i], "gt1l", ds, 1, grid=None)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=read, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert results == ["built-sentinel", "built-sentinel"]
+        # Exactly one delegate, and both threads read through that same one.
+        assert len(constructed) == 1
+        delegate = constructed[0]
+        assert backend._inline is delegate
+        assert sorted(delegate.read_calls) == sorted(urls)
+        # finish_granule forwards to the shared delegate for both granules.
+        for h5, url in zip(h5objs, urls):
+            backend.finish_granule(h5, url)
+        assert sorted(delegate.finished) == sorted(urls)
+
     def test_fetch_workers_validation(self):
         from h5coro_hidefix.zagg_backend import _fetch_workers
 

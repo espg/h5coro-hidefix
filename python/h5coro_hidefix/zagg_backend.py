@@ -44,6 +44,19 @@ counts it as a read error); ``build`` delegates to an internal
 ``inline``-with-write-back backend, so served granules also populate the
 store (zagg issue #160's deployment progression).
 
+Concurrency contract (zagg PR #183): granule reads may interleave across
+worker threads — the worker keeps K granules in flight on a bounded pool,
+calling ``read_group`` from pool threads. Per-granule state must be keyed
+by granule id (full resource URL), and ``finish_granule(h5obj,
+granule_url)`` is called exactly once per granule, from the thread that
+read it. Accordingly, ``_cache`` is granule-id-keyed (single-key get/pop
+per granule, safe under the GIL) and the ``on_miss: build`` delegate is
+constructed under a lock. Version note: ``on_miss: build`` with concurrent
+granules requires zagg >= the release carrying zagg PR #183 (its
+``_pending`` re-key to the full resource URL); older zagg's path-keyed
+``_pending`` would interleave chunk maps across granules in the shared
+inline delegate.
+
 Imports: this module imports zagg (it subclasses the protocol) and lazily
 imports pandas for parquet decoding — both are guaranteed in any
 environment that discovers the entry point (zagg's own). The wheel's
@@ -54,6 +67,7 @@ this module.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
@@ -143,11 +157,14 @@ class SidecarIndex(VirtualIndex):
     def __init__(self, store: str, on_miss: str = "fallback"):
         self.store = store
         self.on_miss = on_miss
-        # Per-granule state (the worker reads granules serially and calls
-        # ``finish_granule`` after each): granule id -> reconstructed Index,
-        # or None when the store had no manifest.
+        # Per-granule state, keyed by granule id (see the concurrency
+        # contract in the module docstring — granule reads may interleave
+        # across worker threads): granule id -> reconstructed Index, or None
+        # when the store had no manifest. Single-key get/pop per granule, so
+        # safe under the GIL as-is.
         self._cache: dict[str, Index | None] = {}
         self._inline = None  # lazily-built inline+write_back delegate (on_miss: build)
+        self._inline_lock = threading.Lock()  # guards _inline's one-time construction
 
     # -- config hooks (validate_index_config has already enforced key sets) --
 
@@ -259,9 +276,16 @@ class SidecarIndex(VirtualIndex):
             )
         if self.on_miss == "build":
             if self._inline is None:
-                from zagg.index.inline import InlineIndex
+                # Double-checked: read_group may run concurrently across
+                # granule threads (see the module docstring's concurrency
+                # contract); construct the shared delegate exactly once.
+                # The import stays lazy so module load never pulls
+                # zagg.index.inline.
+                with self._inline_lock:
+                    if self._inline is None:
+                        from zagg.index.inline import InlineIndex
 
-                self._inline = InlineIndex(write_back=True, store=self.store)
+                        self._inline = InlineIndex(write_back=True, store=self.store)
             return self._inline.read_group(
                 h5obj, group, data_source, shard_key, grid, arrow=arrow
             )
@@ -318,7 +342,13 @@ class SidecarIndex(VirtualIndex):
             )
 
     def finish_granule(self, h5obj, granule_url: str) -> None:
-        """Drop the granule's reconstructed index; forward the write-back seam."""
+        """Drop the granule's reconstructed index; forward the write-back seam.
+
+        Called exactly once per granule, from the thread that read it (the
+        module docstring's concurrency contract) — granule reads may
+        interleave, so the forwarded write-back seam relies on the shared
+        inline delegate keying its pending state by granule id.
+        """
         self._cache.pop(_granule_id(h5obj.resource), None)
         self._cache.pop(_granule_id(granule_url), None)
         if self._inline is not None:

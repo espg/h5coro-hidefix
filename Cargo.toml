@@ -1,6 +1,6 @@
 [package]
 name = "h5coro-hidefix"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Compiled companion to h5coro: hidefix-backed HDF5 chunk indexing, index save/load, chunk enumeration, and fast hyperslab reads"

@@ -389,6 +389,63 @@ class TestProtocolShape:
         with pytest.raises(ValueError, match="requires zagg >= 0.15"):
             backend.read_group(object(), "gt1l", {}, 1, grid=None)
 
+    def test_coalesced_reads_byte_identical(self, sidecar_cls, idx, h5file):
+        """Coalesced fetches (any workers width) must equal direct Index
+        reads byte-for-byte on full reads and multi-chunk hyperslabs --
+        slicing chunks back out of merged spans is invisible to the decoder."""
+
+        class _FakeH5:
+            resource = str(h5file)
+
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                with open(h5file, "rb") as f:
+                    f.seek(pos)
+                    return f.read(size)
+
+        backend = sidecar_cls(store="unused")
+        cols = _manifest_columns(idx, DSETS)
+        vidx = Index.from_chunks(h5file, datasets_from_manifest(cols))
+        for workers in (1, 8):
+            read_fn = backend._read_fn_for(vidx, _FakeH5, workers=workers)
+            for path in DSETS[:2]:
+                assert read_fn(path).tobytes() == idx.read(path).tobytes()
+                hs = [(5, 800), (500, 3500), (2500, 2501)]
+                expect = np.concatenate([idx.read(path, s, e) for s, e in hs])
+                assert read_fn(path, hs).tobytes() == expect.tobytes()
+
+    def test_coalescing_reduces_get_count(self, sidecar_cls, idx, h5file):
+        """Adjacent covering chunks must merge into a handful of GETs: a full
+        read of the 10-chunk gzip dataset previously cost 10 round trips."""
+        import threading
+
+        class _CountingH5:
+            resource = str(h5file)
+            calls: list = []
+            lock = threading.Lock()
+
+            @classmethod
+            def ioRequest(cls, pos, size, caching=True, prefetch=False):  # noqa: N802
+                with cls.lock:
+                    cls.calls.append((pos, size))
+                with open(h5file, "rb") as f:
+                    f.seek(pos)
+                    return f.read(size)
+
+        backend = sidecar_cls(store="unused")
+        cols = _manifest_columns(idx, DSETS)
+        vidx = Index.from_chunks(h5file, datasets_from_manifest(cols))
+        read_fn = backend._read_fn_for(vidx, _CountingH5, workers=8)
+        path = "/gt1l/heights/h_ph"
+        addrs, sizes, _ = vidx.read_plan(path, None, None)
+        assert len(addrs) == 10  # 10_000 elems / 1_000-elem chunks
+        assert read_fn(path).tobytes() == idx.read(path).tobytes()
+        assert len(_CountingH5.calls) <= 2
+        # Every issued GET stays within the coalescing span cap.
+        from h5coro_hidefix.zagg_backend import _COALESCE_MAX_SPAN
+
+        assert all(s <= _COALESCE_MAX_SPAN for _, s in _CountingH5.calls)
+
     def test_fetch_workers_validation(self):
         from h5coro_hidefix.zagg_backend import _fetch_workers
 
@@ -416,3 +473,83 @@ class TestProtocolShape:
         assert _granule_id(f"s3://bucket/prefix/{gid}.h5") == gid
         assert _granule_id(f"https://host/path/{gid}.h5?A-userid=x") == gid
         assert _granule_id(f"/local/dir/{gid}.h5") == gid
+
+
+class TestFetchChunkCoalescing:
+    """Direct ``_fetch_chunks`` behavior against a synthetic byte blob."""
+
+    @staticmethod
+    def _fake(blob, calls=None):
+        class _Fake:
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                if calls is not None:
+                    calls.append((pos, size))
+                return blob[pos : pos + size]
+
+        return _Fake
+
+    def test_unsorted_duplicate_overlapping_ranges(self):
+        """Ranges arrive in chunk-index order, not file order; duplicates and
+        ranges inside an already-merged span are served from it. Buffers come
+        back in INPUT order regardless."""
+        from h5coro_hidefix.zagg_backend import _fetch_chunks
+
+        rng = np.random.default_rng(7)
+        blob = rng.integers(0, 256, size=4096, dtype=np.uint8).tobytes()
+        addrs = [3000, 0, 100, 100, 50, 2000]  # unsorted + duplicate + overlap
+        sizes = [500, 100, 200, 200, 100, 300]
+        for workers in (1, 4):
+            calls: list = []
+            bufs = _fetch_chunks(self._fake(blob, calls), addrs, sizes, workers)
+            assert [bytes(b) for b in bufs] == [
+                blob[a : a + s] for a, s in zip(addrs, sizes)
+            ]
+            # 4 KiB total span, gaps well under 1 MiB: everything is one GET.
+            assert len(calls) == 1
+
+    def test_gap_and_span_caps_split_spans(self):
+        from h5coro_hidefix.zagg_backend import (
+            _COALESCE_GAP,
+            _COALESCE_MAX_SPAN,
+            _merge_ranges,
+        )
+
+        # A gap over _COALESCE_GAP starts a new span.
+        spans, assign = _merge_ranges([0, _COALESCE_GAP + 200], [100, 100])
+        assert len(spans) == 2 and assign == [0, 1]
+        # A merge that would exceed _COALESCE_MAX_SPAN starts a new span.
+        big = _COALESCE_MAX_SPAN - 50
+        spans, assign = _merge_ranges([0, big], [big, 100])
+        assert len(spans) == 2 and assign == [0, 1]
+        # At exactly the caps, the merge happens.
+        spans, _ = _merge_ranges([0, 100 + _COALESCE_GAP], [100, 100])
+        assert len(spans) == 1
+
+    def test_none_span_surfaces_as_os_error(self):
+        """A driver returning None for a MERGED span still raises OSError,
+        serial and pooled alike."""
+        from h5coro_hidefix.zagg_backend import _fetch_chunks
+
+        class _Flaky:
+            @staticmethod
+            def ioRequest(pos, size, caching=True, prefetch=False):  # noqa: N802
+                return None
+
+        # Adjacent ranges -> one merged span; distant ranges -> pooled spans.
+        for addrs, workers in ([0, 100, 200], 1), ([0, 100, 200], 4), ([0, 10**8], 4):
+            with pytest.raises(OSError, match="ranged read failed"):
+                _fetch_chunks(_Flaky, addrs, [100] * len(addrs), workers)
+
+    def test_memoryview_slices_accepted_by_decoder(self, idx, h5file):
+        """Pins the slice type _fetch_chunks emits: read_from_buffers must
+        accept zero-copy memoryview slices of a span buffer (extract_buffers
+        normalizes any bytes-like via the buffer protocol)."""
+        path = "/gt1l/heights/h_ph"
+        addrs, sizes, _ = idx.read_plan(path, None, None)
+        with open(h5file, "rb") as f:
+            blob = f.read()
+        bufs = [memoryview(blob)[int(a) : int(a) + int(s)] for a, s in zip(addrs, sizes)]
+        assert all(isinstance(b, memoryview) for b in bufs)
+        got = idx.read_from_buffers(path, bufs, None, None)
+        assert got.tobytes() == idx.read(path).tobytes()

@@ -76,6 +76,54 @@ def _granule_id(resource) -> str:
     return PurePosixPath(urlsplit(str(resource)).path).stem
 
 
+def _fetch_workers(data_source) -> int:
+    """Chunk-fetch pool width: ``data_source.read_workers`` (zagg issue #170).
+
+    One knob governs both fan-out levels -- zagg pools across datasets with
+    the same key, this backend pools the per-chunk fetches inside each read.
+    zagg validates the value at submission; re-validated here (same message)
+    so a standalone/older-zagg caller still fails loudly instead of silently
+    running serial. Default 8; ``1`` is serial (the pre-pool behavior).
+    """
+    w = (data_source or {}).get("read_workers", 8)
+    if isinstance(w, bool) or not isinstance(w, int) or w < 1:
+        raise ValueError(f"data_source.read_workers must be an integer >= 1 (got {w!r})")
+    return w
+
+
+def _fetch_chunks(h5obj, addrs, sizes, workers: int):
+    """Fetch covering-chunk byte ranges, pooled and order-preserving.
+
+    Each entry is one blocking ranged read through the worker's h5coro
+    driver (``ioRequest(caching=False)`` -- no second credential path).
+    ``ThreadPoolExecutor.map`` preserves input order and re-raises the first
+    failure. A driver that swallows an error and returns ``None`` surfaces
+    as ``OSError`` here -- transient I/O, never misdiagnosed as a decode
+    failure inside ``read_from_buffers`` (zagg PR #173 review lesson).
+
+    Sizing note: total in-flight GETs is bounded by zagg's dataset-level
+    pool times this width; boto3's default connection pool (10) soft-caps
+    the realized concurrency per client, which is safe -- excess fetches
+    queue on the pool rather than erroring.
+    """
+    def fetch(i: int):
+        buf = h5obj.ioRequest(int(addrs[i]), int(sizes[i]), caching=False)
+        if buf is None:
+            raise OSError(
+                f"ranged read failed at {int(addrs[i])}+{int(sizes[i])} "
+                "(driver returned None)"
+            )
+        return buf
+
+    n = len(addrs)
+    if workers <= 1 or n <= 1:
+        return [fetch(i) for i in range(n)]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(workers, n)) as pool:
+        return list(pool.map(fetch, range(n)))
+
+
 class SidecarIndex(VirtualIndex):
     """Selection via the planned route; addressing via the sidecar store."""
 
@@ -155,17 +203,22 @@ class SidecarIndex(VirtualIndex):
 
     # -- addressing seam ------------------------------------------------------
 
-    def _read_fn_for(self, vidx: Index, h5obj):
+    def _read_fn_for(self, vidx: Index, h5obj, workers: int = 8):
         """Buffer-fed reader for ``execute_read_plan``: (path, hyperslice) ->
-        array, fetching chunk ranges through the worker's h5coro driver."""
+        array, fetching chunk ranges through the worker's h5coro driver.
+
+        Chunk fetches are pooled ``workers`` wide (zagg issue #170): the
+        covering chunks of one planned read are independent ranged GETs, and
+        their round trips -- not decode -- dominate the read wall on dense
+        shards, which the dataset-level pool upstream in zagg cannot reach
+        (it only overlaps *different* datasets' reads). Order is preserved,
+        so ``read_from_buffers`` sees exactly the ``read_plan`` order.
+        """
         import numpy as np
 
         def _read(path, start, end):
             addrs, sizes, _ = vidx.read_plan(path, start, end)
-            buffers = [
-                h5obj.ioRequest(int(a), int(s), caching=False)
-                for a, s in zip(addrs, sizes)
-            ]
+            buffers = _fetch_chunks(h5obj, addrs, sizes, workers)
             return vidx.read_from_buffers(path, buffers, start, end)
 
         def read_fn(path, hyperslice=None):
@@ -222,7 +275,8 @@ class SidecarIndex(VirtualIndex):
         try:
             return _planned_read_group(
                 h5obj, group, data_source, shard_key, grid,
-                arrow=arrow, read_fn=self._read_fn_for(vidx, h5obj),
+                arrow=arrow,
+                read_fn=self._read_fn_for(vidx, h5obj, workers=_fetch_workers(data_source)),
             )
         except _ManifestMiss as e:
             return self._miss(
